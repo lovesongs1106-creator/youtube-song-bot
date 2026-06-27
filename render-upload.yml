@@ -1,0 +1,41 @@
+name: Render and Upload YouTube Video
+
+on:
+  repository_dispatch:
+    types: [render_video]
+  workflow_dispatch:
+
+jobs:
+  render-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      YOUTUBE_TOKEN_JSON: ${{ secrets.YOUTUBE_TOKEN_JSON }}
+      GOOGLE_CLIENT_SECRETS_JSON: ${{ secrets.GOOGLE_CLIENT_SECRETS_JSON }}
+      # 1080p default for GitHub Actions. Change repo variables if you want 720p.
+      VIDEO_WIDTH: ${{ vars.VIDEO_WIDTH || '1920' }}
+      VIDEO_HEIGHT: ${{ vars.VIDEO_HEIGHT || '1080' }}
+      VIDEO_FPS: ${{ vars.VIDEO_FPS || '30' }}
+      FFMPEG_PRESET: ${{ vars.FFMPEG_PRESET || 'veryfast' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Render and upload
+        run: python github_worker.py
