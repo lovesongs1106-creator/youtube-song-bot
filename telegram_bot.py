@@ -49,12 +49,14 @@ from bot import (
     YOUTUBE_UPLOAD_SCOPE,
     download_youtube_audio,
     generate_thumbnail,
+    generate_reference_thumbnail,
+    generate_seo_metadata,
     get_youtube_title,
     render_video,
     slugify,
 )
 
-WAITING_LINK, WAITING_OUTRO = range(2)
+WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO = range(5)
 
 ROOT = Path(__file__).parent.resolve()
 TOKENS_DIR = ROOT / "tokens"
@@ -70,6 +72,8 @@ AUTHORIZED_TELEGRAM_USER_ID = os.environ.get("AUTHORIZED_TELEGRAM_USER_ID", "").
 DEFAULT_PRIVACY = os.environ.get("DEFAULT_PRIVACY", "private").strip().lower()
 if DEFAULT_PRIVACY not in {"private", "unlisted", "public"}:
     DEFAULT_PRIVACY = "private"
+
+AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".webm"}
 
 # Webhook mode is better for free hosting because incoming Telegram messages wake the app.
 USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -307,31 +311,147 @@ async def new_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data.clear()
     await update.message.reply_text(
-        "YouTube song link bhejo. Example:\n"
-        "https://www.youtube.com/watch?v=VIDEO_ID\n\n"
-        "Note: sirf wahi link use karo jiska reupload/license permission tumhare paas hai."
+        "Naya video start ✅\n\n"
+        "Pehle full song title bhejo. Example:\n"
+        "Oye Hoye Kya Scene Hai"
     )
+    return WAITING_TITLE
+
+
+async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    title = (update.message.text or "").strip()
+    if len(title) < 2:
+        await update.message.reply_text("Proper song title bhejo.")
+        return WAITING_TITLE
+    context.user_data["song_name"] = title
+    await update.message.reply_text(
+        "Artist/channel/show name bhejo. Example:\n"
+        "India's Got Latent Season 2\n\n"
+        "Agar nahi chahiye to /skip bhejo."
+    )
+    return WAITING_ARTIST
+
+
+async def receive_artist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    artist = (update.message.text or "").strip()
+    context.user_data["artist"] = artist
+    await update.message.reply_text(
+        "Ab thumbnail ke liye reference image/photo bhejo.\n\n"
+        "Ye image poster me use hogi aur uske upar attractive text design banega.\n"
+        "Agar reference nahi dena to /skip bhejo."
+    )
+    return WAITING_REFERENCE
+
+
+async def skip_artist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    context.user_data["artist"] = None
+    await update.message.reply_text(
+        "Ab thumbnail ke liye reference image/photo bhejo. Agar reference nahi dena to /skip bhejo."
+    )
+    return WAITING_REFERENCE
+
+
+async def receive_reference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+
+    ref_file_id = None
+    ext = ".jpg"
+    if update.message.photo:
+        ref_file_id = update.message.photo[-1].file_id
+        ext = ".jpg"
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        ref_file_id = update.message.document.file_id
+        ext = Path(update.message.document.file_name or "reference.jpg").suffix or ".jpg"
+    else:
+        await update.message.reply_text("Please image/photo bhejo, ya /skip bhejo.")
+        return WAITING_REFERENCE
+
+    context.user_data["reference_file_id"] = ref_file_id
+    context.user_data["reference_ext"] = ext
+    await ask_audio_source(update)
     return WAITING_LINK
 
+
+async def skip_reference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    context.user_data["reference_file_id"] = None
+    await ask_audio_source(update)
+    return WAITING_LINK
+
+
+async def ask_audio_source(update: Update) -> None:
+    await update.message.reply_text(
+        "Ab song audio source bhejo:\n\n"
+        "Option 1: Licensed MP3/M4A audio file bhejo — recommended.\n"
+        "Option 2: YouTube link bhejo — kabhi-kabhi cloud par block ho sakta hai.\n\n"
+        "Example link:\nhttps://www.youtube.com/watch?v=VIDEO_ID"
+    )
 
 async def receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
         return ConversationHandler.END
-    text = update.message.text or ""
-    url = extract_youtube_url(text)
-    if not url:
-        await update.message.reply_text("Valid YouTube link nahi mila. Dobara link bhejo.")
+
+    # Source can be a YouTube link OR an uploaded audio file.
+    if update.message.text:
+        text = update.message.text or ""
+        url = extract_youtube_url(text)
+        if not url:
+            await update.message.reply_text(
+                "Valid YouTube link nahi mila. Ya to proper YouTube link bhejo, ya licensed MP3/M4A audio file bhejo."
+            )
+            return WAITING_LINK
+
+        detected_title = get_youtube_title(url) or context.user_data.get("song_name") or "YouTube Song"
+        context.user_data["source_type"] = "youtube_url"
+        context.user_data["youtube_url"] = url
+        context.user_data.setdefault("song_name", detected_title)
+        await update.message.reply_text(
+            f"Audio source set ho gaya. Title: {context.user_data['song_name']}\n\n"
+            "Ab apna 30–40 sec outro video bhejo as Telegram video/document."
+        )
+        return WAITING_OUTRO
+
+    tg_file_id = None
+    ext = ".mp3"
+    title = "Telegram Audio"
+
+    if update.message.audio:
+        tg_file_id = update.message.audio.file_id
+        title = update.message.audio.title or update.message.audio.file_name or "Telegram Audio"
+        ext = Path(update.message.audio.file_name or "song.mp3").suffix or ".mp3"
+    elif update.message.document:
+        name = update.message.document.file_name or "song.mp3"
+        ext = Path(name).suffix.lower() or ".mp3"
+        if ext not in AUDIO_EXTS:
+            await update.message.reply_text(
+                "Ye audio file nahi lag rahi. Please MP3/M4A/WAV/AAC/FLAC/OGG file bhejo, ya YouTube link bhejo."
+            )
+            return WAITING_LINK
+        tg_file_id = update.message.document.file_id
+        title = Path(name).stem or "Telegram Audio"
+    else:
+        await update.message.reply_text("Please YouTube link ya song audio file bhejo.")
         return WAITING_LINK
 
-    title = get_youtube_title(url) or "YouTube Song"
-    context.user_data["youtube_url"] = url
-    context.user_data["song_name"] = title
+    context.user_data["source_type"] = "telegram_audio"
+    context.user_data["audio_file_id"] = tg_file_id
+    context.user_data["audio_ext"] = ext
+    context.user_data.setdefault("song_name", title)
     await update.message.reply_text(
-        f"Song detect hua: {title}\n\n"
+        f"Audio mil gaya. Title: {context.user_data['song_name']}\n\n"
         "Ab apna 30–40 sec outro video bhejo as Telegram video/document."
     )
     return WAITING_OUTRO
-
 
 async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
@@ -356,8 +476,10 @@ async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO)
 
     user_id = update.effective_user.id
-    youtube_url = context.user_data["youtube_url"]
+    source_type = context.user_data.get("source_type", "youtube_url")
+    youtube_url = context.user_data.get("youtube_url")
     song_name = context.user_data["song_name"]
+    artist = context.user_data.get("artist")
 
     try:
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -372,27 +494,44 @@ async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         tg_file = await context.bot.get_file(tg_file_id)
         await tg_file.download_to_drive(custom_path=str(outro_path))
 
-        await update.message.reply_text("Audio download kar raha hoon...")
-        audio_path = await asyncio.to_thread(download_youtube_audio, youtube_url, job_dir / "downloaded_audio")
+        if source_type == "youtube_url":
+            await update.message.reply_text("Audio download kar raha hoon...")
+            audio_path = await asyncio.to_thread(download_youtube_audio, youtube_url, job_dir / "downloaded_audio")
+        else:
+            await update.message.reply_text("Audio file download kar raha hoon...")
+            audio_ext = context.user_data.get("audio_ext", ".mp3")
+            audio_path = job_dir / f"source_audio{audio_ext}"
+            audio_tg_file = await context.bot.get_file(context.user_data["audio_file_id"])
+            await audio_tg_file.download_to_drive(custom_path=str(audio_path))
 
         await update.message.reply_text("Thumbnail aur video render kar raha hoon...")
-        await asyncio.to_thread(generate_thumbnail, song_name, None, thumb_path)
+        ref_file_id = context.user_data.get("reference_file_id")
+        if ref_file_id:
+            ref_ext = context.user_data.get("reference_ext", ".jpg")
+            ref_path = job_dir / f"reference{ref_ext}"
+            ref_tg_file = await context.bot.get_file(ref_file_id)
+            await ref_tg_file.download_to_drive(custom_path=str(ref_path))
+            await asyncio.to_thread(generate_reference_thumbnail, song_name, artist, ref_path, thumb_path)
+        else:
+            await asyncio.to_thread(generate_thumbnail, song_name, artist, thumb_path)
+
         await asyncio.to_thread(render_video, thumb_path, audio_path, outro_path, video_path, workdir)
 
-        await update.message.reply_text(f"YouTube par upload kar raha hoon as {DEFAULT_PRIVACY}...")
-        description = (
-            "Licensed/permission-based upload.\n\n"
-            f"Source link: {youtube_url}\n"
+        metadata = generate_seo_metadata(song_name, artist, youtube_url)
+        await update.message.reply_text(
+            "SEO metadata ready ✅\n\n"
+            f"Title: {metadata['title']}\n\n"
+            f"Tags: {', '.join(metadata['tags'][:8])}..."
         )
-        tags = ["music", "official audio"]
+        await update.message.reply_text(f"YouTube par upload kar raha hoon as {DEFAULT_PRIVACY}...")
         video_id = await asyncio.to_thread(
             upload_for_user,
             user_id,
             video_path,
             thumb_path,
-            song_name,
-            description,
-            tags,
+            metadata["title"],
+            metadata["description"],
+            metadata["tags"],
             DEFAULT_PRIVACY,
         )
         await update.message.reply_text(
@@ -432,10 +571,19 @@ def build_telegram_app() -> Application:
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
         states={
-            WAITING_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_link)],
+            WAITING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
+            WAITING_ARTIST: [
+                CommandHandler("skip", skip_artist),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_artist),
+            ],
+            WAITING_REFERENCE: [
+                CommandHandler("skip", skip_reference),
+                MessageHandler((filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND, receive_reference),
+            ],
+            WAITING_LINK: [MessageHandler((filters.TEXT | filters.AUDIO | filters.Document.ALL) & ~filters.COMMAND, receive_link)],
             WAITING_OUTRO: [MessageHandler((filters.VIDEO | filters.Document.VIDEO | filters.Document.ALL) & ~filters.COMMAND, receive_outro)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("skip", skip_reference), CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cancel))

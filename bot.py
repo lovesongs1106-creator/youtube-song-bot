@@ -264,6 +264,203 @@ def get_youtube_title(youtube_url: str) -> Optional[str]:
         return None
     return None
 
+
+
+def _cover_resize(img: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Resize/crop image to cover target size."""
+    target_w, target_h = size
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_size = (int(src_w * scale), int(src_h * scale))
+    img = img.resize(new_size, Image.Resampling.LANCZOS)
+    left = (img.width - target_w) // 2
+    top = (img.height - target_h) // 2
+    return img.crop((left, top, left + target_w, top + target_h))
+
+
+def generate_reference_thumbnail(
+    song_name: str,
+    artist: Optional[str],
+    reference_image: Path,
+    output: Path,
+    size=(1280, 720),
+) -> None:
+    """Create a high-impact YouTube thumbnail using user's reference image.
+
+    This is template-based, not AI-generated. It uses the provided image as a blurred/cropped
+    background and creates bold YouTube-style text overlays.
+    """
+    width, height = size
+    ref = Image.open(reference_image).convert("RGB")
+    bg = _cover_resize(ref, size).convert("RGBA")
+    bg = bg.filter(ImageFilter.GaussianBlur(10))
+
+    # dark cinematic overlay
+    overlay = Image.new("RGBA", size, (0, 0, 0, 80))
+    bg.alpha_composite(overlay)
+
+    draw = ImageDraw.Draw(bg)
+
+    # Add warm spotlight/vignette
+    glow = Image.new("RGBA", size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse((-180, -140, 820, 860), fill=(255, 190, 30, 45))
+    gd.ellipse((520, -150, 1500, 830), fill=(255, 80, 20, 35))
+    glow = glow.filter(ImageFilter.GaussianBlur(55))
+    bg.alpha_composite(glow)
+
+    # Right-side hero card with original reference image
+    card_w, card_h = 500, 560
+    card_x, card_y = width - card_w - 55, 80
+    hero = _cover_resize(ref, (card_w, card_h)).convert("RGBA")
+    hero = hero.filter(ImageFilter.UnsharpMask(radius=2, percent=135, threshold=3))
+    mask = Image.new("L", (card_w, card_h), 0)
+    md = ImageDraw.Draw(mask)
+    md.rounded_rectangle((0, 0, card_w, card_h), radius=36, fill=255)
+    shadow = Image.new("RGBA", size, (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sd.rounded_rectangle((card_x + 14, card_y + 18, card_x + card_w + 14, card_y + card_h + 18), radius=36, fill=(0, 0, 0, 150))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(14))
+    bg.alpha_composite(shadow)
+    bg.alpha_composite(hero, (card_x, card_y), mask)
+    draw.rounded_rectangle((card_x, card_y, card_x + card_w, card_y + card_h), radius=36, outline=(255, 210, 60, 220), width=5)
+
+    # Text panel on left
+    panel = Image.new("RGBA", size, (0, 0, 0, 0))
+    pd = ImageDraw.Draw(panel)
+    pd.rounded_rectangle((45, 85, 760, 625), radius=35, fill=(0, 0, 0, 115), outline=(255, 220, 70, 150), width=3)
+    bg.alpha_composite(panel)
+
+    # Fonts
+    title_font = find_font(94, bold=True)
+    title_font_small = find_font(78, bold=True)
+    artist_font = find_font(42, bold=True)
+    badge_font = find_font(30, bold=True)
+
+    title = song_name.upper().strip()
+    max_width = 640
+    lines = wrap_text(draw, title, title_font, max_width)
+    if len(lines) > 3:
+        title_font = title_font_small
+        lines = wrap_text(draw, title, title_font, max_width)
+    if len(lines) > 4:
+        # hard trim for thumbnail readability
+        words = title.split()
+        title = " ".join(words[:8]) + "..."
+        lines = wrap_text(draw, title, title_font_small, max_width)
+        title_font = title_font_small
+
+    # Badge
+    badge = "TRENDING SONG!"
+    bb = draw.textbbox((0, 0), badge, font=badge_font)
+    draw.rounded_rectangle((72, 112, 72 + (bb[2]-bb[0]) + 34, 158), radius=22, fill=(255, 207, 48, 255))
+    draw.text((89, 120), badge, font=badge_font, fill=(15, 15, 15, 255))
+
+    # Title text with yellow/white alternating words/lines
+    y = 190
+    colors = [(255, 255, 255, 255), (255, 218, 46, 255)]
+    for idx, line in enumerate(lines):
+        bbox = draw.textbbox((0, 0), line, font=title_font)
+        x = 78
+        # heavy shadow/stroke effect
+        for dx, dy in [(6, 7), (3, 4), (-2, 3)]:
+            draw.text((x + dx, y + dy), line, font=title_font, fill=(0, 0, 0, 210))
+        draw.text((x, y), line, font=title_font, fill=colors[idx % 2], stroke_width=3, stroke_fill=(0, 0, 0, 230))
+        y += (bbox[3] - bbox[1]) + 10
+
+    # Artist/channel line
+    if artist:
+        artist_text = artist.upper()
+    else:
+        artist_text = "OFFICIAL AUDIO"
+    y += 18
+    draw.text((82, y + 3), artist_text, font=artist_font, fill=(0, 0, 0, 180))
+    draw.text((80, y), artist_text, font=artist_font, fill=(255, 235, 160, 255))
+
+    # Bottom strip
+    strip = "FULL SONG • MUSIC VIDEO"
+    sb = draw.textbbox((0, 0), strip, font=badge_font)
+    draw.rounded_rectangle((72, 555, 72 + (sb[2]-sb[0]) + 40, 606), radius=25, fill=(180, 0, 0, 230), outline=(255, 255, 255, 120), width=2)
+    draw.text((92, 565), strip, font=badge_font, fill=(255, 255, 255, 255))
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    bg.convert("RGB").save(output, quality=95)
+    print(f"Reference thumbnail saved: {output}")
+
+
+def generate_seo_metadata(song_name: str, artist: Optional[str] = None, source_url: Optional[str] = None) -> dict:
+    """Generate professional YouTube SEO metadata for music uploads."""
+    clean_title = song_name.strip()
+    artist_clean = (artist or "").strip()
+    if artist_clean:
+        yt_title = f"{clean_title} - {artist_clean} | Official Audio"
+    else:
+        yt_title = f"{clean_title} | Official Audio"
+    yt_title = yt_title[:100]
+
+    hashtags = []
+    for item in [clean_title, artist_clean, "OfficialAudio", "NewSong"]:
+        if item:
+            tag = re.sub(r"[^A-Za-z0-9]", "", item.title())
+            if tag:
+                hashtags.append("#" + tag)
+    hashtags = list(dict.fromkeys(hashtags))[:5]
+
+    desc_lines = [
+        f"{clean_title} - Official Audio",
+        "",
+        "Enjoy this licensed music upload. Like, share, and subscribe for more songs.",
+        "",
+        f"Song: {clean_title}",
+    ]
+    if artist_clean:
+        desc_lines.append(f"Artist/Channel: {artist_clean}")
+    desc_lines += [
+        "",
+        "Listen with headphones for the best experience.",
+        "",
+    ]
+    if source_url:
+        desc_lines += [f"Source/Reference: {source_url}", ""]
+    desc_lines += [
+        "This upload is shared with permission/license from the rights holder.",
+        "",
+        " ".join(hashtags),
+    ]
+    description = "\n".join(desc_lines)
+
+    base_tags = [
+        clean_title,
+        f"{clean_title} official audio",
+        f"{clean_title} song",
+        f"{clean_title} full song",
+        "official audio",
+        "new song",
+        "music video",
+        "full song",
+        "latest song",
+        "trending song",
+        "viral song",
+        "audio song",
+        "love song",
+        "music",
+    ]
+    if artist_clean:
+        base_tags = [artist_clean, f"{artist_clean} songs", f"{clean_title} {artist_clean}"] + base_tags
+    # YouTube tags total limit is 500 chars; keep concise
+    tags = []
+    total = 0
+    for tag in base_tags:
+        tag = tag.strip()
+        if not tag or tag.lower() in [t.lower() for t in tags]:
+            continue
+        if total + len(tag) + 1 > 450:
+            break
+        tags.append(tag)
+        total += len(tag) + 1
+
+    return {"title": yt_title, "description": description, "tags": tags}
+
 def render_video(thumbnail: Path, audio: Path, outro: Path, output: Path, workdir: Path) -> None:
     check_ffmpeg()
     workdir.mkdir(parents=True, exist_ok=True)
