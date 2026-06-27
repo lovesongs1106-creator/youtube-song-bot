@@ -57,7 +57,7 @@ from bot import (
     slugify,
 )
 
-WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO = range(5)
+WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO, WAITING_RETRY_AUDIO = range(6)
 
 ROOT = Path(__file__).parent.resolve()
 TOKENS_DIR = ROOT / "tokens"
@@ -92,6 +92,7 @@ if os.environ.get("GOOGLE_CLIENT_SECRETS_JSON") and not GOOGLE_CLIENT_SECRETS_PA
 
 # In-memory OAuth state -> Telegram user ID + PKCE verifier mapping.
 OAUTH_STATES: dict[str, dict[str, Any]] = {}
+PENDING_RETRY_JOBS: dict[int, dict[str, Any]] = {}
 telegram_app: Application | None = None
 BOT_LOOP: asyncio.AbstractEventLoop | None = None
 flask_app = Flask(__name__)
@@ -428,6 +429,124 @@ def oauth2callback():
         return f"OAuth failed: {exc}", 500
 
 
+
+
+def parse_tags_text(raw: str | None) -> list[str] | None:
+    if not raw:
+        return None
+    tags = [t.strip() for t in raw.replace("#", "").split(",") if t.strip()]
+    return tags or None
+
+
+def parse_quick_details(text: str) -> dict[str, Any]:
+    """Parse optional one-message metadata.
+
+    Supported formats:
+      Title: My Song
+      Artist: Artist Name
+      YouTube: https://...
+      YT Title: Custom upload title
+      Description: custom desc
+      Tags: tag1, tag2
+
+    Also supports one-line: My Song | Artist Name | https://youtu.be/...
+    """
+    data: dict[str, Any] = {}
+    raw = (text or "").strip()
+    if not raw:
+        return data
+    keymap = {
+        "title": "song_name",
+        "song": "song_name",
+        "song title": "song_name",
+        "artist": "artist",
+        "channel": "artist",
+        "show": "artist",
+        "youtube": "youtube_url",
+        "yt": "youtube_url",
+        "link": "youtube_url",
+        "url": "youtube_url",
+        "yt title": "custom_title",
+        "youtube title": "custom_title",
+        "upload title": "custom_title",
+        "description": "custom_description",
+        "desc": "custom_description",
+        "tags": "custom_tags_raw",
+    }
+    for line in raw.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            key = keymap.get(k.strip().lower())
+            if key and v.strip():
+                data[key] = v.strip()
+    url = extract_youtube_url(raw)
+    if url:
+        data["youtube_url"] = url
+    if not data and "|" in raw:
+        parts = [x.strip() for x in raw.split("|") if x.strip()]
+        if parts:
+            data["song_name"] = parts[0]
+        if len(parts) > 1:
+            data["artist"] = parts[1]
+        if len(parts) > 2 and extract_youtube_url(parts[2]):
+            data["youtube_url"] = extract_youtube_url(parts[2])
+    elif not data:
+        # Treat plain text as title if no URL.
+        if not url:
+            data["song_name"] = raw
+    if data.get("custom_tags_raw"):
+        data["custom_tags"] = parse_tags_text(data.pop("custom_tags_raw"))
+    return data
+
+
+async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """If all required inputs are present, dispatch GitHub worker."""
+    data = context.user_data
+    has_source = data.get("source_type") == "youtube_url" or bool(data.get("audio_file_id"))
+    if not (data.get("song_name") and has_source and data.get("outro_file_id")):
+        missing = []
+        if not data.get("song_name"):
+            missing.append("song title")
+        if not has_source:
+            missing.append("audio file ya YouTube link")
+        if not data.get("outro_file_id"):
+            missing.append("outro video")
+        await update.message.reply_text("Abhi missing hai: " + ", ".join(missing))
+        return False
+
+    user_id = update.effective_user.id
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    payload = {
+        "job_id": f"{user_id}-{stamp}",
+        "chat_id": update.effective_chat.id,
+        "user_id": user_id,
+        "song_name": data["song_name"],
+        "artist": data.get("artist"),
+        "source_type": data.get("source_type", "telegram_audio"),
+        "youtube_url": data.get("youtube_url"),
+        "audio_file_id": data.get("audio_file_id"),
+        "audio_ext": data.get("audio_ext", ".mp3"),
+        "thumbnail_file_id": data.get("thumbnail_file_id"),
+        "thumbnail_ext": data.get("thumbnail_ext", ".jpg"),
+        "reference_file_id": data.get("reference_file_id"),
+        "reference_ext": data.get("reference_ext", ".jpg"),
+        "outro_file_id": data.get("outro_file_id"),
+        "outro_ext": data.get("outro_ext", ".mp4"),
+        "privacy": DEFAULT_PRIVACY,
+        "custom_title": data.get("custom_title"),
+        "custom_description": data.get("custom_description"),
+        "custom_tags": data.get("custom_tags"),
+    }
+    # Save a fallback job so /audio_retry can reuse all details if YouTube link fails.
+    PENDING_RETRY_JOBS[user_id] = payload.copy()
+    if USE_GITHUB_WORKER:
+        await asyncio.to_thread(dispatch_github_worker, payload)
+        await update.message.reply_text("🚀 Job GitHub Actions worker ko bhej diya. Status yahin aayega.")
+    else:
+        await update.message.reply_text("Local render mode me quick dispatch supported nahi. USE_GITHUB_WORKER=true recommended.")
+    context.user_data.clear()
+    return True
+
 async def new_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
         return ConversationHandler.END
@@ -440,8 +559,14 @@ async def new_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(
         "Naya video start ✅\n\n"
-        "Pehle full song title bhejo. Example:\n"
-        "Oye Hoye Kya Scene Hai"
+        "Tum sab details ek message me bhej sakte ho, example:\n\n"
+        "Title: Pieces of You\n"
+        "Artist: Vedansh Jain\n"
+        "YouTube: https://youtu.be/...   optional\n"
+        "YT Title: custom upload title   optional\n"
+        "Description: custom description optional\n"
+        "Tags: tag1, tag2, tag3 optional\n\n"
+        "Ya simple song title bhejo. Uske baad thumbnail/audio/outro files kisi bhi order me bhej sakte ho."
     )
     return WAITING_TITLE
 
@@ -449,18 +574,25 @@ async def new_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
         return ConversationHandler.END
-    title = (update.message.text or "").strip()
-    if len(title) < 2:
+    details = parse_quick_details(update.message.text or "")
+    context.user_data.update(details)
+    if details.get("youtube_url"):
+        context.user_data["source_type"] = "youtube_url"
+
+    if not context.user_data.get("song_name"):
         await update.message.reply_text("Proper song title bhejo.")
         return WAITING_TITLE
-    context.user_data["song_name"] = title
-    await update.message.reply_text(
-        "Artist/channel/show name bhejo. Example:\n"
-        "India's Got Latent Season 2\n\n"
-        "Agar nahi chahiye to /skip bhejo."
-    )
-    return WAITING_ARTIST
 
+    await update.message.reply_text(
+        "Details saved ✅\n\n"
+        "Ab tum ye files kisi bhi order me bhej sakte ho:\n"
+        "1. Exact thumbnail image jo video/poster me use hogi\n"
+        "2. Audio file MP3/M4A agar YouTube link nahi diya\n"
+        "3. Outro video\n\n"
+        "Jab required cheezein mil jayengi, bot khud GitHub worker start kar dega.\n"
+        "Agar artist add/replace karna ho: Artist: name bhej do."
+    )
+    return WAITING_LINK
 
 async def receive_artist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
@@ -524,6 +656,75 @@ async def ask_audio_source(update: Update) -> None:
         "Option 2: YouTube link bhejo — kabhi-kabhi cloud par block ho sakta hai.\n\n"
         "Example link:\nhttps://www.youtube.com/watch?v=VIDEO_ID"
     )
+
+
+async def collect_asset_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    msg = update.message
+
+    if msg.text:
+        details = parse_quick_details(msg.text)
+        if details:
+            context.user_data.update(details)
+            if details.get("youtube_url"):
+                context.user_data["source_type"] = "youtube_url"
+            await update.message.reply_text("Text details/link saved ✅")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    # Photo/image = exact thumbnail now (not reference template)
+    if msg.photo:
+        context.user_data["thumbnail_file_id"] = msg.photo[-1].file_id
+        context.user_data["thumbnail_ext"] = ".jpg"
+        await update.message.reply_text("Exact thumbnail saved ✅ Yehi poster/video thumbnail use hoga.")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    if msg.audio:
+        context.user_data["source_type"] = "telegram_audio"
+        context.user_data["audio_file_id"] = msg.audio.file_id
+        context.user_data["audio_ext"] = Path(msg.audio.file_name or "song.mp3").suffix or ".mp3"
+        if not context.user_data.get("song_name"):
+            context.user_data["song_name"] = msg.audio.title or Path(msg.audio.file_name or "Song").stem
+        await update.message.reply_text("Audio file saved ✅")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    if msg.video:
+        context.user_data["outro_file_id"] = msg.video.file_id
+        context.user_data["outro_ext"] = ".mp4"
+        await update.message.reply_text("Outro video saved ✅")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    if msg.document:
+        name = msg.document.file_name or "file"
+        ext = Path(name).suffix.lower()
+        mime = msg.document.mime_type or ""
+        if mime.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp"}:
+            context.user_data["thumbnail_file_id"] = msg.document.file_id
+            context.user_data["thumbnail_ext"] = ext or ".jpg"
+            await update.message.reply_text("Exact thumbnail image saved ✅")
+        elif ext in AUDIO_EXTS:
+            context.user_data["source_type"] = "telegram_audio"
+            context.user_data["audio_file_id"] = msg.document.file_id
+            context.user_data["audio_ext"] = ext or ".mp3"
+            if not context.user_data.get("song_name"):
+                context.user_data["song_name"] = Path(name).stem
+            await update.message.reply_text("Audio file saved ✅")
+        elif ext in {".mp4", ".mov", ".mkv", ".webm"} or mime.startswith("video/"):
+            context.user_data["outro_file_id"] = msg.document.file_id
+            context.user_data["outro_ext"] = ext or ".mp4"
+            await update.message.reply_text("Outro video saved ✅")
+        else:
+            await update.message.reply_text("File type samajh nahi aaya. Image/audio/outro video bhejo.")
+            return WAITING_LINK
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    await update.message.reply_text("Please text details, thumbnail image, audio file, ya outro video bhejo.")
+    return WAITING_LINK
 
 async def receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
@@ -630,8 +831,13 @@ async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 "youtube_url": youtube_url,
                 "audio_file_id": context.user_data.get("audio_file_id"),
                 "audio_ext": context.user_data.get("audio_ext", ".mp3"),
+                "thumbnail_file_id": context.user_data.get("thumbnail_file_id"),
+                "thumbnail_ext": context.user_data.get("thumbnail_ext", ".jpg"),
                 "reference_file_id": context.user_data.get("reference_file_id"),
                 "reference_ext": context.user_data.get("reference_ext", ".jpg"),
+                "custom_title": context.user_data.get("custom_title"),
+                "custom_description": context.user_data.get("custom_description"),
+                "custom_tags": context.user_data.get("custom_tags"),
                 "outro_file_id": tg_file_id,
                 "outro_ext": ext,
                 "privacy": DEFAULT_PRIVACY,
@@ -703,6 +909,55 @@ async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
+
+async def audio_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+    payload = PENDING_RETRY_JOBS.get(update.effective_user.id)
+    if not payload:
+        await update.message.reply_text("Koi pending failed YouTube-link job nahi mila. /new se start karo.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["retry_payload"] = payload
+    await update.message.reply_text("Same title/thumbnail/outro saved hai ✅ Ab sirf MP3/M4A audio file bhejo.")
+    return WAITING_RETRY_AUDIO
+
+
+async def receive_retry_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    payload = context.user_data.get("retry_payload")
+    if not payload:
+        await update.message.reply_text("Retry data missing. /new se start karo.")
+        return ConversationHandler.END
+    msg = update.message
+    file_id = None
+    ext = ".mp3"
+    if msg.audio:
+        file_id = msg.audio.file_id
+        ext = Path(msg.audio.file_name or "song.mp3").suffix or ".mp3"
+    elif msg.document:
+        name = msg.document.file_name or "song.mp3"
+        ext = Path(name).suffix.lower() or ".mp3"
+        if ext not in AUDIO_EXTS:
+            await update.message.reply_text("Please MP3/M4A/AAC/WAV audio file bhejo.")
+            return WAITING_RETRY_AUDIO
+        file_id = msg.document.file_id
+    else:
+        await update.message.reply_text("Please audio file bhejo.")
+        return WAITING_RETRY_AUDIO
+    payload["source_type"] = "telegram_audio"
+    payload["audio_file_id"] = file_id
+    payload["audio_ext"] = ext
+    payload["youtube_url"] = payload.get("youtube_url")
+    payload["job_id"] = f"{update.effective_user.id}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-retry"
+    await asyncio.to_thread(dispatch_github_worker, payload)
+    await update.message.reply_text("🚀 Retry job GitHub worker ko bhej diya. Ab audio file se render/upload hoga.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     if update.message:
@@ -722,6 +977,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("auth", auth))
     app.add_handler(CommandHandler("export_youtube_token", export_youtube_token))
     app.add_handler(CommandHandler("github_test", github_test))
+    app.add_handler(CommandHandler("audio_retry", audio_retry))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
@@ -735,8 +991,9 @@ def build_telegram_app() -> Application:
                 CommandHandler("skip", skip_reference),
                 MessageHandler((filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND, receive_reference),
             ],
-            WAITING_LINK: [MessageHandler((filters.TEXT | filters.AUDIO | filters.Document.ALL) & ~filters.COMMAND, receive_link)],
+            WAITING_LINK: [MessageHandler((filters.TEXT | filters.PHOTO | filters.AUDIO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, collect_asset_or_text)],
             WAITING_OUTRO: [MessageHandler((filters.VIDEO | filters.Document.VIDEO | filters.Document.ALL) & ~filters.COMMAND, receive_outro)],
+            WAITING_RETRY_AUDIO: [MessageHandler((filters.AUDIO | filters.Document.ALL) & ~filters.COMMAND, receive_retry_audio)],
         },
         fallbacks=[CommandHandler("skip", skip_reference), CommandHandler("cancel", cancel)],
     )

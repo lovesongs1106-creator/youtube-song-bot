@@ -26,6 +26,7 @@ from bot import (
     generate_reference_thumbnail,
     generate_seo_metadata,
     generate_thumbnail,
+    prepare_exact_thumbnail,
     render_video,
 )
 
@@ -174,7 +175,16 @@ def main() -> None:
             if not youtube_url:
                 raise RuntimeError("youtube_url missing for source_type=youtube_url")
             send_message(chat_id, "⬇️ YouTube audio download try kar raha hoon GitHub worker par...")
-            audio_path = download_youtube_audio(youtube_url, job_dir / "downloaded_audio")
+            try:
+                audio_path = download_youtube_audio(youtube_url, job_dir / "downloaded_audio")
+            except Exception as exc:
+                send_message(
+                    chat_id,
+                    "⚠️ YouTube link se audio download fail ho gaya. Shayad human verification / bot check / restricted video issue hai.\n\n"
+                    "Same details repeat karne ki zaroorat nahi. Telegram bot me /audio_retry bhejo, phir sirf song audio file MP3/M4A bhej do. Thumbnail/outro/title saved rahenge.\n\n"
+                    f"Technical error: {exc}"
+                )
+                raise
 
         # Download outro
         outro_ext = payload.get("outro_ext") or ".mp4"
@@ -184,8 +194,15 @@ def main() -> None:
 
         # Thumbnail
         thumb_path = job_dir / "thumbnail.jpg"
+        thumb_file_id = payload.get("thumbnail_file_id")
         ref_file_id = payload.get("reference_file_id")
-        if ref_file_id:
+        if thumb_file_id:
+            thumb_ext = payload.get("thumbnail_ext") or ".jpg"
+            raw_thumb_path = job_dir / f"user_thumbnail{thumb_ext}"
+            send_message(chat_id, "🖼️ Tumhara diya hua exact thumbnail prepare kar raha hoon...")
+            download_telegram_file(thumb_file_id, raw_thumb_path)
+            prepare_exact_thumbnail(raw_thumb_path, thumb_path)
+        elif ref_file_id:
             ref_ext = payload.get("reference_ext") or ".jpg"
             ref_path = job_dir / f"reference{ref_ext}"
             send_message(chat_id, "🎨 Reference thumbnail generate kar raha hoon...")
@@ -201,7 +218,14 @@ def main() -> None:
         render_video(thumb_path, audio_path, outro_path, video_path, job_dir / "work")
 
         # Metadata + upload
-        metadata = generate_seo_metadata(song_name, artist, youtube_url)
+        metadata = generate_seo_metadata(
+            song_name,
+            artist,
+            youtube_url,
+            custom_title=payload.get("custom_title"),
+            custom_description=payload.get("custom_description"),
+            custom_tags=payload.get("custom_tags"),
+        )
         send_message(
             chat_id,
             "✅ SEO metadata ready\n\n"

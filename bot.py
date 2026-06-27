@@ -278,6 +278,38 @@ def _cover_resize(img: Image.Image, size: tuple[int, int]) -> Image.Image:
     return img.crop((left, top, left + target_w, top + target_h))
 
 
+
+
+def prepare_exact_thumbnail(input_image: Path, output: Path, size=(1280, 720)) -> None:
+    """Prepare user-made thumbnail exactly as the video poster/YouTube thumbnail.
+
+    The user's image is preserved as much as possible. If not 16:9, it is resized with
+    padding/blurred background instead of adding text or changing the design.
+    """
+    width, height = size
+    img = Image.open(input_image).convert("RGB")
+
+    # If already 16:9-ish, cover resize to exact size. Otherwise fit with blurred background.
+    src_ratio = img.width / img.height
+    target_ratio = width / height
+    if abs(src_ratio - target_ratio) < 0.08:
+        out = _cover_resize(img, size).convert("RGB")
+    else:
+        bg = _cover_resize(img, size).convert("RGB").filter(ImageFilter.GaussianBlur(18))
+        dark = Image.new("RGB", size, (0, 0, 0))
+        bg = Image.blend(bg, dark, 0.25)
+        scale = min(width / img.width, height / img.height)
+        new_size = (int(img.width * scale), int(img.height * scale))
+        fg = img.resize(new_size, Image.Resampling.LANCZOS)
+        x = (width - fg.width) // 2
+        y = (height - fg.height) // 2
+        bg.paste(fg, (x, y))
+        out = bg
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    out.save(output, quality=95)
+    print(f"Exact thumbnail saved: {output}")
+
 def generate_reference_thumbnail(
     song_name: str,
     artist: Optional[str],
@@ -390,7 +422,14 @@ def generate_reference_thumbnail(
     print(f"Reference thumbnail saved: {output}")
 
 
-def generate_seo_metadata(song_name: str, artist: Optional[str] = None, source_url: Optional[str] = None) -> dict:
+def generate_seo_metadata(
+    song_name: str,
+    artist: Optional[str] = None,
+    source_url: Optional[str] = None,
+    custom_title: Optional[str] = None,
+    custom_description: Optional[str] = None,
+    custom_tags: Optional[list[str]] = None,
+) -> dict:
     """Generate professional YouTube SEO metadata for music uploads."""
     clean_title = song_name.strip()
     artist_clean = (artist or "").strip()
@@ -460,6 +499,13 @@ def generate_seo_metadata(song_name: str, artist: Optional[str] = None, source_u
             break
         tags.append(tag)
         total += len(tag) + 1
+
+    if custom_title:
+        yt_title = custom_title.strip()[:100]
+    if custom_description:
+        description = custom_description.strip()
+    if custom_tags:
+        tags = [t.strip() for t in custom_tags if t and t.strip()]
 
     return {"title": yt_title, "description": description, "tags": tags}
 
