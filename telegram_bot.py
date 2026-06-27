@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -70,6 +71,10 @@ DEFAULT_PRIVACY = os.environ.get("DEFAULT_PRIVACY", "private").strip().lower()
 if DEFAULT_PRIVACY not in {"private", "unlisted", "public"}:
     DEFAULT_PRIVACY = "private"
 
+# Webhook mode is better for free hosting because incoming Telegram messages wake the app.
+USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "true").strip().lower() in {"1", "true", "yes", "on"}
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me-secret").strip()
+
 GOOGLE_CLIENT_SECRETS_PATH = ROOT / "client_secrets.json"
 if os.environ.get("GOOGLE_CLIENT_SECRETS_JSON") and not GOOGLE_CLIENT_SECRETS_PATH.exists():
     GOOGLE_CLIENT_SECRETS_PATH.write_text(os.environ["GOOGLE_CLIENT_SECRETS_JSON"], encoding="utf-8")
@@ -78,6 +83,8 @@ if os.environ.get("GOOGLE_CLIENT_SECRETS_JSON") and not GOOGLE_CLIENT_SECRETS_PA
 OAUTH_STATES: dict[str, int] = {}
 telegram_app: Application | None = None
 flask_app = Flask(__name__)
+# Render/other hosts terminate HTTPS at a proxy. This makes Flask respect X-Forwarded-Proto=https.
+flask_app.wsgi_app = ProxyFix(flask_app.wsgi_app, x_proto=1, x_host=1)
 
 
 def allowed(update: Update) -> bool:
@@ -234,6 +241,18 @@ def home():
     return "YouTube Song Telegram Bot is running. Open Telegram and use /start."
 
 
+@flask_app.route(f"/telegram/{WEBHOOK_SECRET}", methods=["POST"])
+def telegram_webhook():
+    if telegram_app is None:
+        return "Bot not ready", 503
+    try:
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), telegram_app.loop)
+        return "OK"
+    except Exception as exc:
+        return f"Webhook error: {exc}", 500
+
+
 @flask_app.route("/oauth2callback")
 def oauth2callback():
     state = request.args.get("state", "")
@@ -242,7 +261,12 @@ def oauth2callback():
         return "Invalid/expired OAuth state. Go back to Telegram and send /auth again.", 400
     try:
         flow = make_flow(state=state)
-        flow.fetch_token(authorization_response=request.url)
+        # Some hosts pass the callback to Flask as http internally even though the public URL is https.
+        # OAuth requires https, so rebuild the callback from BASE_URL.
+        authorization_response = f"{BASE_URL}/oauth2callback"
+        if request.query_string:
+            authorization_response += "?" + request.query_string.decode("utf-8")
+        flow.fetch_token(authorization_response=authorization_response)
         creds = flow.credentials
         token_file_for_user(user_id).write_text(creds.to_json(), encoding="utf-8")
         OAUTH_STATES.pop(state, None)
@@ -387,15 +411,11 @@ def run_flask() -> None:
     flask_app.run(host="0.0.0.0", port=port)
 
 
-def main() -> None:
-    global telegram_app
-    if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN env var missing.")
-
-    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("id", my_id))
-    telegram_app.add_handler(CommandHandler("auth", auth))
+def build_telegram_app() -> Application:
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("id", my_id))
+    app.add_handler(CommandHandler("auth", auth))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
@@ -405,12 +425,36 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-    telegram_app.add_handler(conv)
-    telegram_app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("cancel", cancel))
+    return app
 
-    thread = threading.Thread(target=run_flask, daemon=True)
-    thread.start()
-    telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def main() -> None:
+    global telegram_app
+    if not TELEGRAM_BOT_TOKEN:
+        raise SystemExit("TELEGRAM_BOT_TOKEN env var missing.")
+
+    telegram_app = build_telegram_app()
+
+    if USE_WEBHOOK:
+        if not BASE_URL:
+            raise SystemExit("BASE_URL env var missing. Required for webhook mode.")
+        webhook_url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
+
+        async def runner() -> None:
+            await telegram_app.initialize()
+            await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+            await telegram_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+            await telegram_app.start()
+            print(f"Telegram webhook set: {webhook_url}")
+            run_flask()
+
+        asyncio.run(runner())
+    else:
+        thread = threading.Thread(target=run_flask, daemon=True)
+        thread.start()
+        telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
