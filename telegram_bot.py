@@ -202,20 +202,81 @@ def extract_youtube_url(text: str) -> str | None:
 
 
 
+
+
+def normalize_github_repo(raw: str) -> str:
+    """Accept owner/repo OR GitHub URL and return owner/repo."""
+    repo = (raw or "").strip()
+    repo = repo.replace("https://github.com/", "").replace("http://github.com/", "")
+    repo = repo.replace("github.com/", "")
+    repo = repo.strip().strip("/")
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    # If user pasted URL with extra path, keep only owner/repo
+    parts = [x for x in repo.split("/") if x]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return repo
+
+
+def github_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_repo_diagnostics() -> str:
+    if not GITHUB_REPO:
+        return "❌ GITHUB_REPO missing. Format: username/repo-name"
+    if not GITHUB_TOKEN:
+        return "❌ GITHUB_TOKEN missing. Add GitHub PAT in Render env."
+    repo = normalize_github_repo(GITHUB_REPO)
+    url = f"https://api.github.com/repos/{repo}"
+    r = requests.get(url, headers=github_headers(), timeout=60)
+    if r.status_code == 200:
+        data = r.json()
+        return (
+            "✅ GitHub repo access OK\n"
+            f"Repo: {data.get('full_name')}\n"
+            f"Private: {data.get('private')}\n"
+            "Dispatch should work if workflow file is on default branch."
+        )
+    if r.status_code == 404:
+        return (
+            "❌ GitHub repo access failed: 404 Not Found\n\n"
+            f"GITHUB_REPO currently: {GITHUB_REPO}\n"
+            f"Parsed as: {repo}\n\n"
+            "Fix checklist:\n"
+            "1. GITHUB_REPO must be exactly: username/repo-name\n"
+            "2. Do NOT use full URL unless latest code parses it.\n"
+            "3. Repo must exist.\n"
+            "4. If repo is private, PAT must have access to that repo.\n"
+            "5. Fine-grained PAT: Repository access = selected repo, Permissions > Contents = Read and Write.\n"
+            "6. Classic PAT: scope repo enabled."
+        )
+    return f"❌ GitHub repo check failed: {r.status_code}\n{r.text[:1000]}"
+
 def dispatch_github_worker(payload: dict[str, Any]) -> None:
     if not GITHUB_REPO:
         raise RuntimeError("GITHUB_REPO env var missing. Example: yourname/youtube-song-bot")
     if not GITHUB_TOKEN:
         raise RuntimeError("GITHUB_TOKEN env var missing. Add GitHub PAT in Render env.")
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    repo = normalize_github_repo(GITHUB_REPO)
+    url = f"https://api.github.com/repos/{repo}/dispatches"
     body = {"event_type": GITHUB_EVENT_TYPE, "client_payload": payload}
-    r = requests.post(url, headers=headers, json=body, timeout=60)
+    r = requests.post(url, headers=github_headers(), json=body, timeout=60)
     if r.status_code not in (200, 201, 202, 204):
+        if r.status_code == 404:
+            diag = github_repo_diagnostics()
+            raise RuntimeError(
+                "GitHub dispatch failed: 404 Not Found\n\n"
+                + diag
+                + "\n\nRender env expected:\n"
+                "GITHUB_REPO=username/repo-name\n"
+                "GITHUB_TOKEN=PAT with repo access"
+            )
         raise RuntimeError(f"GitHub dispatch failed: {r.status_code} {r.text[:1000]}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -230,6 +291,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Commands:\n"
         "/auth - YouTube channel connect karo\n"
         "/export_youtube_token - GitHub Actions secret ke liye token export karo\n"
+        "/github_test - GitHub repo/token connection check karo\n"
         "/new - Naya video banao aur upload karo\n"
         "/id - Apna Telegram user ID dekho\n"
         "/cancel - Current process cancel"
@@ -241,6 +303,19 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Your Telegram user ID: {update.effective_user.id}")
 
 
+
+
+async def github_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    await update.message.reply_text("GitHub connection test kar raha hoon...")
+    try:
+        result = await asyncio.to_thread(github_repo_diagnostics)
+        await update.message.reply_text(result)
+    except Exception as exc:
+        await update.message.reply_text(f"❌ GitHub test error:\n{exc}")
 
 async def export_youtube_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send the user's YouTube OAuth token JSON for adding to GitHub Actions secrets.
@@ -644,6 +719,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler("auth", auth))
     app.add_handler(CommandHandler("export_youtube_token", export_youtube_token))
+    app.add_handler(CommandHandler("github_test", github_test))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
