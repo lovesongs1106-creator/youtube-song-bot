@@ -322,7 +322,9 @@ def generate_reference_thumbnail(
     sd.rounded_rectangle((card_x + 14, card_y + 18, card_x + card_w + 14, card_y + card_h + 18), radius=36, fill=(0, 0, 0, 150))
     shadow = shadow.filter(ImageFilter.GaussianBlur(14))
     bg.alpha_composite(shadow)
-    bg.alpha_composite(hero, (card_x, card_y), mask)
+    # Paste rounded hero image with mask. alpha_composite has no mask parameter.
+    bg.paste(hero, (card_x, card_y), mask)
+    draw = ImageDraw.Draw(bg)
     draw.rounded_rectangle((card_x, card_y, card_x + card_w, card_y + card_h), radius=36, outline=(255, 210, 60, 220), width=5)
 
     # Text panel on left
