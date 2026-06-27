@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: youtube-song-telegram-bot
+    env: docker
+    plan: free
+    autoDeploy: true
