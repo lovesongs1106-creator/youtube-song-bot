@@ -82,6 +82,7 @@ if os.environ.get("GOOGLE_CLIENT_SECRETS_JSON") and not GOOGLE_CLIENT_SECRETS_PA
 # In-memory OAuth state -> Telegram user ID mapping.
 OAUTH_STATES: dict[str, int] = {}
 telegram_app: Application | None = None
+BOT_LOOP: asyncio.AbstractEventLoop | None = None
 flask_app = Flask(__name__)
 # Render/other hosts terminate HTTPS at a proxy. This makes Flask respect X-Forwarded-Proto=https.
 flask_app.wsgi_app = ProxyFix(flask_app.wsgi_app, x_proto=1, x_host=1)
@@ -246,8 +247,10 @@ def telegram_webhook():
     if telegram_app is None:
         return "Bot not ready", 503
     try:
+        if BOT_LOOP is None:
+            return "Bot loop not ready", 503
         update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), telegram_app.loop)
+        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), BOT_LOOP)
         return "OK"
     except Exception as exc:
         return f"Webhook error: {exc}", 500
@@ -271,13 +274,13 @@ def oauth2callback():
         token_file_for_user(user_id).write_text(creds.to_json(), encoding="utf-8")
         OAUTH_STATES.pop(state, None)
 
-        if telegram_app:
+        if telegram_app and BOT_LOOP:
             asyncio.run_coroutine_threadsafe(
                 telegram_app.bot.send_message(
                     chat_id=user_id,
                     text="✅ YouTube channel connected. Ab /new bhejo aur video banao.",
                 ),
-                telegram_app.loop,
+                BOT_LOOP,
             )
         return "Success! YouTube connected. You can close this page and go back to Telegram."
     except Exception as exc:
@@ -442,15 +445,21 @@ def main() -> None:
             raise SystemExit("BASE_URL env var missing. Required for webhook mode.")
         webhook_url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
 
-        async def runner() -> None:
-            await telegram_app.initialize()
-            await telegram_app.bot.delete_webhook(drop_pending_updates=True)
-            await telegram_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
-            await telegram_app.start()
-            print(f"Telegram webhook set: {webhook_url}")
-            run_flask()
+        def bot_loop_thread() -> None:
+            global BOT_LOOP
+            loop = asyncio.new_event_loop()
+            BOT_LOOP = loop
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(telegram_app.initialize())
+            loop.run_until_complete(telegram_app.bot.delete_webhook(drop_pending_updates=True))
+            loop.run_until_complete(telegram_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES))
+            loop.run_until_complete(telegram_app.start())
+            print(f"Telegram webhook set: {webhook_url}", flush=True)
+            loop.run_forever()
 
-        asyncio.run(runner())
+        thread = threading.Thread(target=bot_loop_thread, daemon=True)
+        thread.start()
+        run_flask()
     else:
         thread = threading.Thread(target=run_flask, daemon=True)
         thread.start()
