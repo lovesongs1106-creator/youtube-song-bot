@@ -79,8 +79,8 @@ GOOGLE_CLIENT_SECRETS_PATH = ROOT / "client_secrets.json"
 if os.environ.get("GOOGLE_CLIENT_SECRETS_JSON") and not GOOGLE_CLIENT_SECRETS_PATH.exists():
     GOOGLE_CLIENT_SECRETS_PATH.write_text(os.environ["GOOGLE_CLIENT_SECRETS_JSON"], encoding="utf-8")
 
-# In-memory OAuth state -> Telegram user ID mapping.
-OAUTH_STATES: dict[str, int] = {}
+# In-memory OAuth state -> Telegram user ID + PKCE verifier mapping.
+OAUTH_STATES: dict[str, dict[str, Any]] = {}
 telegram_app: Application | None = None
 BOT_LOOP: asyncio.AbstractEventLoop | None = None
 flask_app = Flask(__name__)
@@ -113,14 +113,18 @@ def load_client_config() -> dict[str, Any]:
     return json.loads(GOOGLE_CLIENT_SECRETS_PATH.read_text(encoding="utf-8"))
 
 
-def make_flow(state: str | None = None) -> Flow:
+def make_flow(state: str | None = None, code_verifier: str | None = None) -> Flow:
     if not BASE_URL:
         raise RuntimeError("BASE_URL env var is required for mobile OAuth.")
+    kwargs = {}
+    if code_verifier:
+        kwargs["code_verifier"] = code_verifier
     flow = Flow.from_client_config(
         load_client_config(),
         scopes=YOUTUBE_UPLOAD_SCOPE,
         state=state,
         redirect_uri=f"{BASE_URL}/oauth2callback",
+        **kwargs,
     )
     return flow
 
@@ -223,8 +227,11 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state = secrets.token_urlsafe(24)
-    OAUTH_STATES[state] = update.effective_user.id
-    flow = make_flow(state=state)
+    # PKCE needs the same code_verifier during callback. If we don't keep it,
+    # Google returns: invalid_grant Missing code verifier.
+    code_verifier = secrets.token_urlsafe(64)
+    OAUTH_STATES[state] = {"user_id": update.effective_user.id, "code_verifier": code_verifier}
+    flow = make_flow(state=state, code_verifier=code_verifier)
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
@@ -259,11 +266,13 @@ def telegram_webhook():
 @flask_app.route("/oauth2callback")
 def oauth2callback():
     state = request.args.get("state", "")
-    user_id = OAUTH_STATES.get(state)
-    if not user_id:
+    state_data = OAUTH_STATES.get(state)
+    if not state_data:
         return "Invalid/expired OAuth state. Go back to Telegram and send /auth again.", 400
+    user_id = int(state_data["user_id"])
+    code_verifier = state_data.get("code_verifier")
     try:
-        flow = make_flow(state=state)
+        flow = make_flow(state=state, code_verifier=code_verifier)
         # Some hosts pass the callback to Flask as http internally even though the public URL is https.
         # OAuth requires https, so rebuild the callback from BASE_URL.
         authorization_response = f"{BASE_URL}/oauth2callback"
