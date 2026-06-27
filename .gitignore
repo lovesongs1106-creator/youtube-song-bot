@@ -1,0 +1,12 @@
+# Secrets / tokens
+client_secrets.json
+token.json
+*.credentials.json
+
+# Generated media
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
