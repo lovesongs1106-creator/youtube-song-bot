@@ -265,7 +265,9 @@ def dispatch_github_worker(payload: dict[str, Any]) -> None:
         raise RuntimeError("GITHUB_TOKEN env var missing. Add GitHub PAT in Render env.")
     repo = normalize_github_repo(GITHUB_REPO)
     url = f"https://api.github.com/repos/{repo}/dispatches"
-    body = {"event_type": GITHUB_EVENT_TYPE, "client_payload": payload}
+    # GitHub repository_dispatch allows max 10 top-level client_payload properties.
+    # Wrap everything inside one `job` object to avoid 422 errors.
+    body = {"event_type": GITHUB_EVENT_TYPE, "client_payload": {"job": payload}}
     r = requests.post(url, headers=github_headers(), json=body, timeout=60)
     if r.status_code not in (200, 201, 202, 204):
         if r.status_code == 404:

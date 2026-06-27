@@ -50,6 +50,10 @@ def read_payload() -> dict[str, Any]:
     payload = event.get("client_payload") or {}
     if not payload:
         raise RuntimeError("repository_dispatch client_payload missing.")
+    # New controller wraps all fields under `job` to satisfy GitHub's max 10 top-level
+    # client_payload properties rule. Keep backward compatibility with old payloads.
+    if isinstance(payload.get("job"), dict):
+        payload = payload["job"]
     return payload
 
 
