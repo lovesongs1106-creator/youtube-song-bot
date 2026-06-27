@@ -24,6 +24,7 @@ import os
 import re
 import secrets
 import threading
+import requests
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,12 @@ AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".webm"}
 # Webhook mode is better for free hosting because incoming Telegram messages wake the app.
 USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "true").strip().lower() in {"1", "true", "yes", "on"}
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me-secret").strip()
+
+# If true, Render only controls Telegram and dispatches heavy video work to GitHub Actions.
+USE_GITHUB_WORKER = os.environ.get("USE_GITHUB_WORKER", "false").strip().lower() in {"1", "true", "yes", "on"}
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()  # example: username/youtube-song-bot
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()  # PAT with repo dispatch permission
+GITHUB_EVENT_TYPE = os.environ.get("GITHUB_EVENT_TYPE", "render_video").strip()
 
 GOOGLE_CLIENT_SECRETS_PATH = ROOT / "client_secrets.json"
 if os.environ.get("GOOGLE_CLIENT_SECRETS_JSON") and not GOOGLE_CLIENT_SECRETS_PATH.exists():
@@ -193,6 +200,24 @@ def extract_youtube_url(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+
+
+def dispatch_github_worker(payload: dict[str, Any]) -> None:
+    if not GITHUB_REPO:
+        raise RuntimeError("GITHUB_REPO env var missing. Example: yourname/youtube-song-bot")
+    if not GITHUB_TOKEN:
+        raise RuntimeError("GITHUB_TOKEN env var missing. Add GitHub PAT in Render env.")
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = {"event_type": GITHUB_EVENT_TYPE, "client_payload": payload}
+    r = requests.post(url, headers=headers, json=body, timeout=60)
+    if r.status_code not in (200, 201, 202, 204):
+        raise RuntimeError(f"GitHub dispatch failed: {r.status_code} {r.text[:1000]}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
         return
@@ -204,6 +229,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Default privacy: {DEFAULT_PRIVACY}\n\n"
         "Commands:\n"
         "/auth - YouTube channel connect karo\n"
+        "/export_youtube_token - GitHub Actions secret ke liye token export karo\n"
         "/new - Naya video banao aur upload karo\n"
         "/id - Apna Telegram user ID dekho\n"
         "/cancel - Current process cancel"
@@ -214,6 +240,31 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user and update.message:
         await update.message.reply_text(f"Your Telegram user ID: {update.effective_user.id}")
 
+
+
+async def export_youtube_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the user's YouTube OAuth token JSON for adding to GitHub Actions secrets.
+
+    Owner-only if AUTHORIZED_TELEGRAM_USER_ID is set. Treat this as highly sensitive.
+    """
+    if await reject_if_unauthorized(update):
+        return
+    if not update.effective_user or not update.message:
+        return
+    token_path = token_file_for_user(update.effective_user.id)
+    if not token_path.exists():
+        await update.message.reply_text("YouTube token nahi mila. Pehle /auth complete karo.")
+        return
+    await update.message.reply_text(
+        "⚠️ Sensitive token export. Is content ko sirf GitHub repo Secret me paste karna:\n"
+        "Secret name: YOUTUBE_TOKEN_JSON\n\n"
+        "Isko kisi ke saath share mat karna."
+    )
+    await update.message.reply_document(
+        document=token_path.open("rb"),
+        filename="YOUTUBE_TOKEN_JSON.txt",
+        caption="GitHub Secret me value ke andar is file ka full content paste karo."
+    )
 
 async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
@@ -491,6 +542,31 @@ async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         video_path = job_dir / f"{base}.mp4"
         workdir = job_dir / "work"
 
+        if USE_GITHUB_WORKER:
+            job_payload = {
+                "job_id": f"{user_id}-{stamp}",
+                "chat_id": update.effective_chat.id,
+                "user_id": user_id,
+                "song_name": song_name,
+                "artist": artist,
+                "source_type": source_type,
+                "youtube_url": youtube_url,
+                "audio_file_id": context.user_data.get("audio_file_id"),
+                "audio_ext": context.user_data.get("audio_ext", ".mp3"),
+                "reference_file_id": context.user_data.get("reference_file_id"),
+                "reference_ext": context.user_data.get("reference_ext", ".jpg"),
+                "outro_file_id": tg_file_id,
+                "outro_ext": ext,
+                "privacy": DEFAULT_PRIVACY,
+            }
+            await asyncio.to_thread(dispatch_github_worker, job_payload)
+            await update.message.reply_text(
+                "🚀 Job GitHub Actions worker ko bhej diya.\n"
+                "Ab heavy 1080p/720p render GitHub par hoga. Status yahin Telegram par aayega."
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
         tg_file = await context.bot.get_file(tg_file_id)
         await tg_file.download_to_drive(custom_path=str(outro_path))
 
@@ -567,6 +643,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler("auth", auth))
+    app.add_handler(CommandHandler("export_youtube_token", export_youtube_token))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],

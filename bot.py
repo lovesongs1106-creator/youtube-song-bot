@@ -463,8 +463,28 @@ def generate_seo_metadata(song_name: str, artist: Optional[str] = None, source_u
 
     return {"title": yt_title, "description": description, "tags": tags}
 
+
+
+def get_render_settings() -> tuple[int, int, int, str]:
+    """Low-memory render settings for small cloud instances.
+
+    Defaults to 720p/24fps because 1080p x264 can exceed 512MB RAM on free hosts.
+    Override with env vars:
+      VIDEO_WIDTH=1280
+      VIDEO_HEIGHT=720
+      VIDEO_FPS=24
+      FFMPEG_PRESET=ultrafast
+    If Render free still OOMs, try VIDEO_WIDTH=854 VIDEO_HEIGHT=480.
+    """
+    width = int(os.environ.get("VIDEO_WIDTH", "1280"))
+    height = int(os.environ.get("VIDEO_HEIGHT", "720"))
+    fps = int(os.environ.get("VIDEO_FPS", "24"))
+    preset = os.environ.get("FFMPEG_PRESET", "ultrafast")
+    return width, height, fps, preset
+
 def render_video(thumbnail: Path, audio: Path, outro: Path, output: Path, workdir: Path) -> None:
     check_ffmpeg()
+    width, height, fps, preset = get_render_settings()
     workdir.mkdir(parents=True, exist_ok=True)
     main_video = workdir / "main_song_video.mp4"
     outro_norm = workdir / "outro_normalized.mp4"
@@ -477,11 +497,13 @@ def render_video(thumbnail: Path, audio: Path, outro: Path, output: Path, workdi
         "-i", str(thumbnail),
         "-i", str(audio),
         "-c:v", "libx264",
+        "-preset", preset,
         "-tune", "stillimage",
+        "-threads", "1",
         "-c:a", "aac",
-        "-b:a", "192k",
+        "-b:a", "160k",
         "-pix_fmt", "yuv420p",
-        "-vf", "scale=1920:1080,setsar=1,fps=30",
+        "-vf", f"scale={width}:{height},setsar=1,fps={fps}",
         "-shortest",
         str(main_video),
     ])
@@ -490,12 +512,14 @@ def render_video(thumbnail: Path, audio: Path, outro: Path, output: Path, workdi
     run([
         "ffmpeg", "-y",
         "-i", str(outro),
-        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
+        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}",
         "-c:v", "libx264",
+        "-preset", preset,
+        "-threads", "1",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
-        "-b:a", "192k",
-        "-ar", "48000",
+        "-b:a", "160k",
+        "-ar", "44100",
         str(outro_norm),
     ])
 
