@@ -575,12 +575,19 @@ def render_video(thumbnail: Path, audio: Path, outro: Path, output: Path, workdi
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)
+    # Final concat WITHOUT -c copy (ensures audio never mutes)
     run([
         "ffmpeg", "-y",
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_file),
-        "-c", "copy",
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-threads", "1",
+        "-c:a", "aac",
+        "-b:a", "160k",
+        "-ar", "44100",
+        "-ac", "2",
         str(output),
     ])
     print(f"Final video saved: {output}")

@@ -566,7 +566,7 @@ async def new_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "YT Title: custom upload title   optional\n"
         "Description: custom description optional\n"
         "Tags: tag1, tag2, tag3 optional\n\n"
-        "Ya simple song title bhejo. Uske baad thumbnail/audio/outro files kisi bhi order me bhej sakte ho."
+        "Ya simple song title bhejo. Ab files bhi kisi bhi order me bhej sakte ho — thumbnail/audio/outro pehle bhi chalega. Jo missing hoga bot bata dega."
     )
     return WAITING_TITLE
 
@@ -982,7 +982,8 @@ def build_telegram_app() -> Application:
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
         states={
-            WAITING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
+            # After /new accept title/details OR files in any order.
+            WAITING_TITLE: [MessageHandler((filters.TEXT | filters.PHOTO | filters.AUDIO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, collect_asset_or_text)],
             WAITING_ARTIST: [
                 CommandHandler("skip", skip_artist),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_artist),
