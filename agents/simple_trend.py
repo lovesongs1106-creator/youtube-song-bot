@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Simple Trend Discovery Agent"""
+"""Simple Trend Discovery (Minimal)"""
 
 import sqlite3
+from datetime import datetime
 
 DB_PATH = "storage/trends.db"
 
@@ -19,5 +20,5 @@ def generate_daily_report():
     report = "📈 Today’s Best Upload Opportunities\n\n"
     for i, (song, artist) in enumerate(opps, 1):
         report += f"{i}. {song}\n   {artist}\n\n"
-    report += "Buttons: [Approve Song] [Refresh]"
+    report += "Buttons: Approve Song | Refresh"
     return report
