@@ -1000,7 +1000,11 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
     if not ENABLE_APPROVE_WORKFLOW:
-        await query.edit_message_text("Approve workflow is currently disabled.")
+        try:
+            await query.edit_message_text("Approve workflow is currently disabled.")
+        except Exception as e:
+            if "Message is not modified" not in str(e):
+                raise
         return
 
     # Trend approval payload - uses YouTube URL for audio (no manual upload)
@@ -1027,12 +1031,16 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     await asyncio.to_thread(dispatch_github_worker, payload)
 
-    await query.edit_message_text(
-        f"✅ Approved!\n\n"
-        f"Title: {metadata['title']}\n"
-        f"Privacy: {DEFAULT_PRIVACY}\n\n"
-        "🚀 Job sent to GitHub Actions. Audio will be downloaded from YouTube URL."
-    )
+    try:
+        await query.edit_message_text(
+            f"✅ Approved!\n\n"
+            f"Title: {metadata['title']}\n"
+            f"Privacy: {DEFAULT_PRIVACY}\n\n"
+            "🚀 Job sent to GitHub Actions. Audio will be downloaded from YouTube URL."
+        )
+    except Exception as e:
+        if "Message is not modified" not in str(e):
+            raise
 
 
 async def refresh_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
