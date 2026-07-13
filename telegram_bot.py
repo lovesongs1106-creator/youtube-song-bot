@@ -344,7 +344,7 @@ async def refresh_report_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text(report_text, reply_markup=reply_markup)
 
 
-# ==================== OLD FUNCTIONS (KEEPING ALL) ====================
+# ==================== OLD FUNCTIONS ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
@@ -587,7 +587,429 @@ async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_
     return True
 
 
-# ==================== build_telegram_app ====================
+async def new_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+    if not token_file_for_user(update.effective_user.id).exists():
+        await update.message.reply_text("Pehle /auth bhej ke YouTube channel connect karo.")
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Naya video start ✅\n\n"
+        "Tum sab details ek message me bhej sakte ho, example:\n\n"
+        "Title: Pieces of You\n"
+        "Artist: Vedansh Jain\n"
+        "YouTube: https://youtu.be/...   optional\n"
+        "YT Title: custom upload title   optional\n"
+        "Description: custom description optional\n"
+        "Tags: tag1, tag2, tag3 optional\n\n"
+        "Ya simple song title bhejo. Ab files bhi kisi bhi order me bhej sakte ho — thumbnail/audio/outro pehle bhi chalega. Jo missing hoga bot bata dega."
+    )
+    return WAITING_TITLE
+
+
+async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    details = parse_quick_details(update.message.text or "")
+    context.user_data.update(details)
+    if details.get("youtube_url"):
+        context.user_data["source_type"] = "youtube_url"
+
+    if not context.user_data.get("song_name"):
+        await update.message.reply_text("Proper song title bhejo.")
+        return WAITING_TITLE
+
+    await update.message.reply_text(
+        "Details saved ✅\n\n"
+        "Ab tum ye files kisi bhi order me bhej sakte ho:\n"
+        "1. Exact thumbnail image jo video/poster me use hogi\n"
+        "2. Audio file MP3/M4A agar YouTube link nahi diya\n"
+        "3. Outro video\n\n"
+        "Jab required cheezein mil jayengi, bot khud GitHub worker start kar dega.\n"
+        "Agar artist add/replace karna ho: Artist: name bhej do."
+    )
+    return WAITING_LINK
+
+
+async def receive_artist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    artist = (update.message.text or "").strip()
+    context.user_data["artist"] = artist
+    await update.message.reply_text(
+        "Ab thumbnail ke liye reference image/photo bhejo.\n\n"
+        "Ye image poster me use hogi aur uske upar attractive text design banega.\n"
+        "Agar reference nahi dena to /skip bhejo."
+    )
+    return WAITING_REFERENCE
+
+
+async def skip_artist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    context.user_data["artist"] = None
+    await update.message.reply_text(
+        "Ab thumbnail ke liye reference image/photo bhejo. Agar reference nahi dena to /skip bhejo."
+    )
+    return WAITING_REFERENCE
+
+
+async def receive_reference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+
+    ref_file_id = None
+    ext = ".jpg"
+    if update.message.photo:
+        ref_file_id = update.message.photo[-1].file_id
+        ext = ".jpg"
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        ref_file_id = update.message.document.file_id
+        ext = Path(update.message.document.file_name or "reference.jpg").suffix or ".jpg"
+    else:
+        await update.message.reply_text("Please image/photo bhejo, ya /skip bhejo.")
+        return WAITING_REFERENCE
+
+    context.user_data["reference_file_id"] = ref_file_id
+    context.user_data["reference_ext"] = ext
+    await ask_audio_source(update)
+    return WAITING_LINK
+
+
+async def skip_reference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    context.user_data["reference_file_id"] = None
+    await ask_audio_source(update)
+    return WAITING_LINK
+
+
+async def ask_audio_source(update: Update) -> None:
+    await update.message.reply_text(
+        "Ab song audio source bhejo:\n\n"
+        "Option 1: Licensed MP3/M4A audio file bhejo — recommended.\n"
+        "Option 2: YouTube link bhejo — kabhi-kabhi cloud par block ho sakta hai.\n\n"
+        "Example link:\nhttps://www.youtube.com/watch?v=VIDEO_ID"
+    )
+
+
+async def collect_asset_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    msg = update.message
+
+    if msg.text:
+        details = parse_quick_details(msg.text)
+        if details:
+            context.user_data.update(details)
+            if details.get("youtube_url"):
+                context.user_data["source_type"] = "youtube_url"
+            await update.message.reply_text("Text details/link saved ✅")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    if msg.photo:
+        context.user_data["thumbnail_file_id"] = msg.photo[-1].file_id
+        context.user_data["thumbnail_ext"] = ".jpg"
+        await update.message.reply_text("Exact thumbnail saved ✅ Yehi poster/video thumbnail use hoga.")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    if msg.audio:
+        context.user_data["source_type"] = "telegram_audio"
+        context.user_data["audio_file_id"] = msg.audio.file_id
+        context.user_data["audio_ext"] = Path(msg.audio.file_name or "song.mp3").suffix or ".mp3"
+        if not context.user_data.get("song_name"):
+            context.user_data["song_name"] = msg.audio.title or Path(msg.audio.file_name or "Song").stem
+        await update.message.reply_text("Audio file saved ✅")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    if msg.video:
+        context.user_data["outro_file_id"] = msg.video.file_id
+        context.user_data["outro_ext"] = ".mp4"
+        await update.message.reply_text("Outro video saved ✅")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    if msg.document:
+        name = msg.document.file_name or "file"
+        ext = Path(name).suffix.lower()
+        mime = msg.document.mime_type or ""
+        if mime.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp"}:
+            context.user_data["thumbnail_file_id"] = msg.document.file_id
+            context.user_data["thumbnail_ext"] = ext or ".jpg"
+            await update.message.reply_text("Exact thumbnail image saved ✅")
+        elif ext in AUDIO_EXTS:
+            context.user_data["source_type"] = "telegram_audio"
+            context.user_data["audio_file_id"] = msg.document.file_id
+            context.user_data["audio_ext"] = ext or ".mp3"
+            if not context.user_data.get("song_name"):
+                context.user_data["song_name"] = Path(name).stem
+            await update.message.reply_text("Audio file saved ✅")
+        elif ext in {".mp4", ".mov", ".mkv", ".webm"} or mime.startswith("video/"):
+            context.user_data["outro_file_id"] = msg.document.file_id
+            context.user_data["outro_ext"] = ext or ".mp4"
+            await update.message.reply_text("Outro video saved ✅")
+        else:
+            await update.message.reply_text("File type samajh nahi aaya. Image/audio/outro video bhejo.")
+            return WAITING_LINK
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    await update.message.reply_text("Please text details, thumbnail image, audio file, ya outro video bhejo.")
+    return WAITING_LINK
+
+
+async def receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+
+    if update.message.text:
+        text = update.message.text or ""
+        url = extract_youtube_url(text)
+        if not url:
+            await update.message.reply_text(
+                "Valid YouTube link nahi mila. Ya to proper YouTube link bhejo, ya licensed MP3/M4A audio file bhejo."
+            )
+            return WAITING_LINK
+
+        detected_title = get_youtube_title(url) or context.user_data.get("song_name") or "YouTube Song"
+        context.user_data["source_type"] = "youtube_url"
+        context.user_data["youtube_url"] = url
+        context.user_data.setdefault("song_name", detected_title)
+        await update.message.reply_text(
+            f"Audio source set ho gaya. Title: {context.user_data['song_name']}\n\n"
+            "Ab apna 30–40 sec outro video bhejo as Telegram video/document."
+        )
+        return WAITING_OUTRO
+
+    tg_file_id = None
+    ext = ".mp3"
+    title = "Telegram Audio"
+
+    if update.message.audio:
+        tg_file_id = update.message.audio.file_id
+        title = update.message.audio.title or update.message.audio.file_name or "Telegram Audio"
+        ext = Path(update.message.audio.file_name or "song.mp3").suffix or ".mp3"
+    elif update.message.document:
+        name = update.message.document.file_name or "song.mp3"
+        ext = Path(name).suffix.lower() or ".mp3"
+        if ext not in AUDIO_EXTS:
+            await update.message.reply_text(
+                "Ye audio file nahi lag rahi. Please MP3/M4A/WAV/AAC/FLAC/OGG file bhejo, ya YouTube link bhejo."
+            )
+            return WAITING_LINK
+        tg_file_id = update.message.document.file_id
+        title = Path(name).stem or "Telegram Audio"
+    else:
+        await update.message.reply_text("Please YouTube link ya song audio file bhejo.")
+        return WAITING_LINK
+
+    context.user_data["source_type"] = "telegram_audio"
+    context.user_data["audio_file_id"] = tg_file_id
+    context.user_data["audio_ext"] = ext
+    context.user_data.setdefault("song_name", title)
+    await update.message.reply_text(
+        f"Audio mil gaya. Title: {context.user_data['song_name']}\n\n"
+        "Ab apna 30–40 sec outro video bhejo as Telegram video/document."
+    )
+    return WAITING_OUTRO
+
+
+async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+
+    tg_file_id = None
+    ext = ".mp4"
+    if update.message.video:
+        tg_file_id = update.message.video.file_id
+        ext = ".mp4"
+    elif update.message.document:
+        tg_file_id = update.message.document.file_id
+        name = update.message.document.file_name or "outro.mp4"
+        ext = Path(name).suffix or ".mp4"
+    else:
+        await update.message.reply_text("Please outro video file bhejo, text/photo nahi.")
+        return WAITING_OUTRO
+
+    await update.message.reply_text("Outro mil gaya. Ab video generate + upload start kar raha hoon. Thoda time lagega.")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO)
+
+    user_id = update.effective_user.id
+    source_type = context.user_data.get("source_type", "youtube_url")
+    youtube_url = context.user_data.get("youtube_url")
+    song_name = context.user_data["song_name"]
+    artist = context.user_data.get("artist")
+
+    try:
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = slugify(song_name)
+        job_dir = OUTPUTS_DIR / f"telegram-{user_id}-{base}-{stamp}"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        outro_path = job_dir / f"outro{ext}"
+        thumb_path = job_dir / "thumbnail.jpg"
+        video_path = job_dir / f"{base}.mp4"
+        workdir = job_dir / "work"
+
+        if USE_GITHUB_WORKER:
+            job_payload = {
+                "job_id": f"{user_id}-{stamp}",
+                "chat_id": update.effective_chat.id,
+                "user_id": user_id,
+                "song_name": song_name,
+                "artist": artist,
+                "source_type": source_type,
+                "youtube_url": youtube_url,
+                "audio_file_id": context.user_data.get("audio_file_id"),
+                "audio_ext": context.user_data.get("audio_ext", ".mp3"),
+                "thumbnail_file_id": context.user_data.get("thumbnail_file_id"),
+                "thumbnail_ext": context.user_data.get("thumbnail_ext", ".jpg"),
+                "reference_file_id": context.user_data.get("reference_file_id"),
+                "reference_ext": context.user_data.get("reference_ext", ".jpg"),
+                "custom_title": context.user_data.get("custom_title"),
+                "custom_description": context.user_data.get("custom_description"),
+                "custom_tags": context.user_data.get("custom_tags"),
+                "outro_file_id": tg_file_id,
+                "outro_ext": ext,
+                "privacy": DEFAULT_PRIVACY,
+            }
+            await asyncio.to_thread(dispatch_github_worker, job_payload)
+            await update.message.reply_text(
+                "🚀 Job GitHub Actions worker ko bhej diya.\n"
+                "Ab heavy 1080p/720p render GitHub par hoga. Status yahin Telegram par aayega."
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        tg_file = await context.bot.get_file(tg_file_id)
+        await tg_file.download_to_drive(custom_path=str(outro_path))
+
+        if source_type == "youtube_url":
+            await update.message.reply_text("Audio download kar raha hoon...")
+            audio_path = await asyncio.to_thread(download_youtube_audio, youtube_url, job_dir / "downloaded_audio")
+        else:
+            await update.message.reply_text("Audio file download kar raha hoon...")
+            audio_ext = context.user_data.get("audio_ext", ".mp3")
+            audio_path = job_dir / f"source_audio{audio_ext}"
+            audio_tg_file = await context.bot.get_file(context.user_data["audio_file_id"])
+            await audio_tg_file.download_to_drive(custom_path=str(audio_path))
+
+        await update.message.reply_text("Thumbnail aur video render kar raha hoon...")
+        ref_file_id = context.user_data.get("reference_file_id")
+        if ref_file_id:
+            ref_ext = context.user_data.get("reference_ext", ".jpg")
+            ref_path = job_dir / f"reference{ref_ext}"
+            ref_tg_file = await context.bot.get_file(ref_file_id)
+            await ref_tg_file.download_to_drive(custom_path=str(ref_path))
+            await asyncio.to_thread(generate_reference_thumbnail, song_name, artist, ref_path, thumb_path)
+        else:
+            await asyncio.to_thread(generate_thumbnail, song_name, artist, thumb_path)
+
+        await asyncio.to_thread(render_video, thumb_path, audio_path, outro_path, video_path, workdir)
+
+        metadata = generate_seo_metadata(song_name, artist, youtube_url)
+        await update.message.reply_text(
+            "SEO metadata ready ✅\n\n"
+            f"Title: {metadata['title']}\n\n"
+            f"Tags: {', '.join(metadata['tags'][:8])}..."
+        )
+        await update.message.reply_text(f"YouTube par upload kar raha hoon as {DEFAULT_PRIVACY}...")
+        video_id = await asyncio.to_thread(
+            upload_for_user,
+            user_id,
+            video_path,
+            thumb_path,
+            metadata["title"],
+            metadata["description"],
+            metadata["tags"],
+            DEFAULT_PRIVACY,
+        )
+        await update.message.reply_text(
+            "✅ Done bhai! Video upload ho gaya:\n"
+            f"https://www.youtube.com/watch?v={video_id}"
+        )
+    except Exception as exc:
+        await update.message.reply_text(
+            "❌ Error aa gaya:\n"
+            f"{exc}\n\n"
+            "Agar YouTube download issue hai to yt-dlp update karna padega, ya hosting storage/time limit ho sakti hai."
+        )
+    finally:
+        context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+async def audio_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+    payload = PENDING_RETRY_JOBS.get(update.effective_user.id)
+    if not payload:
+        await update.message.reply_text("Koi pending failed YouTube-link job nahi mila. /new se start karo.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["retry_payload"] = payload
+    await update.message.reply_text("Same title/thumbnail/outro saved hai ✅ Ab sirf MP3/M4A audio file bhejo.")
+    return WAITING_RETRY_AUDIO
+
+
+async def receive_retry_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    payload = context.user_data.get("retry_payload")
+    if not payload:
+        await update.message.reply_text("Retry data missing. /new se start karo.")
+        return ConversationHandler.END
+    msg = update.message
+    file_id = None
+    ext = ".mp3"
+    if msg.audio:
+        file_id = msg.audio.file_id
+        ext = Path(msg.audio.file_name or "song.mp3").suffix or ".mp3"
+    elif msg.document:
+        name = msg.document.file_name or "song.mp3"
+        ext = Path(name).suffix.lower() or ".mp3"
+        if ext not in AUDIO_EXTS:
+            await update.message.reply_text("Please MP3/M4A/AAC/WAV audio file bhejo.")
+            return WAITING_RETRY_AUDIO
+        file_id = msg.document.file_id
+    else:
+        await update.message.reply_text("Please audio file bhejo.")
+        return WAITING_RETRY_AUDIO
+    payload["source_type"] = "telegram_audio"
+    payload["audio_file_id"] = file_id
+    payload["audio_ext"] = ext
+    payload["youtube_url"] = payload.get("youtube_url")
+    payload["job_id"] = f"{update.effective_user.id}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-retry"
+    await asyncio.to_thread(dispatch_github_worker, payload)
+    await update.message.reply_text("🚀 Retry job GitHub worker ko bhej diya. Ab audio file se render/upload hoga.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    if update.message:
+        await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+def run_flask() -> None:
+    port = int(os.environ.get("PORT", "8080"))
+    flask_app.run(host="0.0.0.0", port=port)
+
 
 def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
