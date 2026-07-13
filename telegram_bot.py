@@ -1003,14 +1003,13 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Approve workflow is currently disabled.")
         return
 
-    # Use a sample song from the report for demonstration
+    # Trend approval payload - uses YouTube URL for audio (no manual upload)
     song_name = "Sample Trending Song"
     artist = "Sample Artist"
+    youtube_url = "https://www.youtube.com/watch?v=dQw4w9wgccc"  # Placeholder - replace with real trend URL later
 
-    # Generate SEO using existing function
-    metadata = generate_seo_metadata(song_name, artist, None)
+    metadata = generate_seo_metadata(song_name, artist, youtube_url)
 
-    # Prepare payload for existing pipeline
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     payload = {
         "job_id": f"trend-{stamp}",
@@ -1018,21 +1017,21 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
         "user_id": update.effective_user.id,
         "song_name": song_name,
         "artist": artist,
-        "source_type": "telegram_audio",  # Will be replaced by real audio later
+        "source_type": "youtube_url",      # Trend workflow uses YouTube URL
+        "youtube_url": youtube_url,
         "privacy": DEFAULT_PRIVACY,
         "custom_title": metadata["title"],
         "custom_description": metadata["description"],
         "custom_tags": metadata["tags"],
     }
 
-    # Reuse existing GitHub Actions dispatch (same as /new)
     await asyncio.to_thread(dispatch_github_worker, payload)
 
     await query.edit_message_text(
         f"✅ Approved!\n\n"
         f"Title: {metadata['title']}\n"
         f"Privacy: {DEFAULT_PRIVACY}\n\n"
-        "🚀 Job sent to GitHub Actions. You will receive the private YouTube link here."
+        "🚀 Job sent to GitHub Actions. Audio will be downloaded from YouTube URL."
     )
 
 
@@ -1090,12 +1089,16 @@ def build_telegram_app() -> Application:
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cancel))
 
+    print(f"ENABLE_RECOMMENDATIONS value: {ENABLE_RECOMMENDATIONS}")
+
     if ENABLE_RECOMMENDATIONS:
+        print("REGISTERING DAILY REPORT HANDLER")
         app.add_handler(CommandHandler("daily_report", daily_report))
+        print("DAILY REPORT HANDLER REGISTERED")
 
     if ENABLE_APPROVE_WORKFLOW:
         from telegram.ext import CallbackQueryHandler
-        app.add_handler(CallbackQueryHandler(approve_song_callback, pattern="^approve_song$"))
+        app.add_handler(CallbackQueryHandler(approve_song_callback, pattern="^approve_trend_"))
         app.add_handler(CallbackQueryHandler(refresh_report_callback, pattern="^refresh_report$"))
 
     return app
