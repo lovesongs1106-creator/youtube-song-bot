@@ -19,24 +19,36 @@ def is_valid_song(title):
     return bool(re.search(r'\b(official|audio|song|music|full)\b', title_lower))
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS trends
-                 (id INTEGER PRIMARY KEY, song_name TEXT, artist TEXT, youtube_url TEXT,
-                  trend_score REAL, opportunity_score REAL, collected_at TEXT)''')
-    conn.commit()
-    conn.close()
+    try:
+        from pathlib import Path
+        db_file = Path(DB_PATH)
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_file))
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS trends
+                     (id INTEGER PRIMARY KEY, song_name TEXT, artist TEXT, youtube_url TEXT,
+                      trend_score REAL, opportunity_score REAL, collected_at TEXT)''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"WARNING: trend DB disabled: {e}")
 
 def get_real_trends(limit=5):
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""SELECT song_name, artist, youtube_url, opportunity_score 
-                 FROM trends 
-                 ORDER BY opportunity_score DESC LIMIT ?""", (limit,))
-    results = c.fetchall()
-    conn.close()
-    return results
+    try:
+        from pathlib import Path
+        db_file = Path(DB_PATH)
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_file))
+        c = conn.cursor()
+        c.execute("""SELECT song_name, artist, youtube_url, opportunity_score 
+                     FROM trends 
+                     ORDER BY opportunity_score DESC LIMIT ?""", (limit,))
+        results = c.fetchall()
+        conn.close()
+        return results
+    except Exception as e:
+        print(f"WARNING: get_real_trends failed: {e}")
+        return []
 
 def generate_daily_report():
     opps = get_real_trends(5)
@@ -84,14 +96,19 @@ def collect_real_trends():
     return results[:8]
 
 def save_trends(trends):
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    for t in trends:
-        c.execute("""INSERT INTO trends 
-                     (song_name, artist, youtube_url, trend_score, opportunity_score, collected_at)
-                     VALUES (?, ?, ?, ?, ?, ?)""",
-                  (t["song_name"], t["artist"], t["youtube_url"], 
-                   t["trend_score"], t["opportunity_score"], t["collected_at"]))
-    conn.commit()
-    conn.close()
+    try:
+        from pathlib import Path
+        db_file = Path(DB_PATH)
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_file))
+        c = conn.cursor()
+        for t in trends:
+            c.execute("""INSERT INTO trends 
+                         (song_name, artist, youtube_url, trend_score, opportunity_score, collected_at)
+                         VALUES (?, ?, ?, ?, ?, ?)""",
+                      (t["song_name"], t["artist"], t["youtube_url"], 
+                       t["trend_score"], t["opportunity_score"], t["collected_at"]))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"WARNING: save_trends failed: {e}")
