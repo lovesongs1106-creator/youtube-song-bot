@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
 Telegram front-end for YouTube Song Automation Bot.
+
+Mobile flow:
+  /auth -> connect YouTube channel once
+  /new  -> send YouTube song link -> send outro video -> bot generates + uploads
+
+Environment variables:
+  TELEGRAM_BOT_TOKEN              Required. From @BotFather.
+  BASE_URL                        Required for OAuth. Example: https://your-app.onrender.com
+  GOOGLE_CLIENT_SECRETS_JSON      Optional JSON string. If not set, uses client_secrets.json file.
+  AUTHORIZED_TELEGRAM_USER_ID     Optional. Restrict bot to one Telegram numeric user ID.
+  DEFAULT_PRIVACY                 Optional: private/unlisted/public. Default: private.
+  PORT                            Optional. Hosting provider usually sets this.
 """
 
 from __future__ import annotations
@@ -23,7 +35,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -32,7 +44,6 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
-    CallbackQueryHandler,
 )
 
 from bot import (
@@ -73,23 +84,27 @@ if DEFAULT_PRIVACY not in {"private", "unlisted", "public"}:
 
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".webm"}
 
+# Webhook mode is better for free hosting because incoming Telegram messages wake the app.
 USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "true").strip().lower() in {"1", "true", "yes", "on"}
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me-secret").strip()
 
+# If true, Render only controls Telegram and dispatches heavy video work to GitHub Actions.
 USE_GITHUB_WORKER = os.environ.get("USE_GITHUB_WORKER", "false").strip().lower() in {"1", "true", "yes", "on"}
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()  # example: username/youtube-song-bot
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()  # PAT with repo dispatch permission
 GITHUB_EVENT_TYPE = os.environ.get("GITHUB_EVENT_TYPE", "render_video").strip()
 
 GOOGLE_CLIENT_SECRETS_PATH = ROOT / "client_secrets.json"
 if os.environ.get("GOOGLE_CLIENT_SECRETS_JSON") and not GOOGLE_CLIENT_SECRETS_PATH.exists():
     GOOGLE_CLIENT_SECRETS_PATH.write_text(os.environ["GOOGLE_CLIENT_SECRETS_JSON"], encoding="utf-8")
 
+# In-memory OAuth state -> Telegram user ID + PKCE verifier mapping.
 OAUTH_STATES: dict[str, dict[str, Any]] = {}
 PENDING_RETRY_JOBS: dict[int, dict[str, Any]] = {}
 telegram_app: Application | None = None
 BOT_LOOP: asyncio.AbstractEventLoop | None = None
 flask_app = Flask(__name__)
+# Render/other hosts terminate HTTPS at a proxy. This makes Flask respect X-Forwarded-Proto=https.
 flask_app.wsgi_app = ProxyFix(flask_app.wsgi_app, x_proto=1, x_host=1)
 
 
@@ -194,13 +209,19 @@ def extract_youtube_url(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+
+
+
+
 def normalize_github_repo(raw: str) -> str:
+    """Accept owner/repo OR GitHub URL and return owner/repo."""
     repo = (raw or "").strip()
     repo = repo.replace("https://github.com/", "").replace("http://github.com/", "")
     repo = repo.replace("github.com/", "")
     repo = repo.strip().strip("/")
     if repo.endswith(".git"):
         repo = repo[:-4]
+    # If user pasted URL with extra path, keep only owner/repo
     parts = [x for x in repo.split("/") if x]
     if len(parts) >= 2:
         return f"{parts[0]}/{parts[1]}"
@@ -246,7 +267,6 @@ def github_repo_diagnostics() -> str:
         )
     return f"❌ GitHub repo check failed: {r.status_code}\n{r.text[:1000]}"
 
-
 def dispatch_github_worker(payload: dict[str, Any]) -> None:
     if not GITHUB_REPO:
         raise RuntimeError("GITHUB_REPO env var missing. Example: yourname/youtube-song-bot")
@@ -254,6 +274,8 @@ def dispatch_github_worker(payload: dict[str, Any]) -> None:
         raise RuntimeError("GITHUB_TOKEN env var missing. Add GitHub PAT in Render env.")
     repo = normalize_github_repo(GITHUB_REPO)
     url = f"https://api.github.com/repos/{repo}/dispatches"
+    # GitHub repository_dispatch allows max 10 top-level client_payload properties.
+    # Wrap everything inside one `job` object to avoid 422 errors.
     body = {"event_type": GITHUB_EVENT_TYPE, "client_payload": {"job": payload}}
     r = requests.post(url, headers=github_headers(), json=body, timeout=60)
     if r.status_code not in (200, 201, 202, 204):
@@ -267,84 +289,6 @@ def dispatch_github_worker(payload: dict[str, Any]) -> None:
                 "GITHUB_TOKEN=PAT with repo access"
             )
         raise RuntimeError(f"GitHub dispatch failed: {r.status_code} {r.text[:1000]}")
-
-
-# ==================== DAILY REPORT + APPROVE WORKFLOW ====================
-
-async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await reject_if_unauthorized(update):
-        return
-    if not ENABLE_RECOMMENDATIONS:
-        await update.message.reply_text("Trend recommendations are currently disabled.")
-        return
-
-    report_text = generate_daily_report()
-
-    keyboard = [
-        [InlineKeyboardButton("Approve Song", callback_data="approve_song")],
-        [InlineKeyboardButton("Refresh", callback_data="refresh_report")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(report_text, reply_markup=reply_markup)
-
-
-async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    if not ENABLE_APPROVE_WORKFLOW:
-        await query.edit_message_text("Approve workflow is currently disabled.")
-        return
-
-    song_name = "Sample Trending Song"
-    artist = "Sample Artist"
-
-    metadata = generate_seo_metadata(song_name, artist, None)
-
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    payload = {
-        "job_id": f"trend-{stamp}",
-        "chat_id": update.effective_chat.id,
-        "user_id": update.effective_user.id,
-        "song_name": song_name,
-        "artist": artist,
-        "source_type": "telegram_audio",
-        "privacy": DEFAULT_PRIVACY,
-        "custom_title": metadata["title"],
-        "custom_description": metadata["description"],
-        "custom_tags": metadata["tags"],
-    }
-
-    await asyncio.to_thread(dispatch_github_worker, payload)
-
-    await query.edit_message_text(
-        f"✅ Approved!\n\n"
-        f"Title: {metadata['title']}\n"
-        f"Privacy: {DEFAULT_PRIVACY}\n\n"
-        "🚀 Job sent to GitHub Actions. You will receive the private YouTube link here."
-    )
-
-
-async def refresh_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    if not ENABLE_RECOMMENDATIONS:
-        await query.edit_message_text("Trend recommendations are currently disabled.")
-        return
-
-    report_text = generate_daily_report()
-    keyboard = [
-        [InlineKeyboardButton("Approve Song", callback_data="approve_song")],
-        [InlineKeyboardButton("Refresh", callback_data="refresh_report")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(report_text, reply_markup=reply_markup)
-
-
-# ==================== OLD FUNCTIONS ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
@@ -370,6 +314,8 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Your Telegram user ID: {update.effective_user.id}")
 
 
+
+
 async def github_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
         return
@@ -382,8 +328,11 @@ async def github_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as exc:
         await update.message.reply_text(f"❌ GitHub test error:\n{exc}")
 
-
 async def export_youtube_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the user's YouTube OAuth token JSON for adding to GitHub Actions secrets.
+
+    Owner-only if AUTHORIZED_TELEGRAM_USER_ID is set. Treat this as highly sensitive.
+    """
     if await reject_if_unauthorized(update):
         return
     if not update.effective_user or not update.message:
@@ -403,7 +352,6 @@ async def export_youtube_token(update: Update, context: ContextTypes.DEFAULT_TYP
         caption="GitHub Secret me value ke andar is file ka full content paste karo."
     )
 
-
 async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
         return
@@ -420,6 +368,8 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state = secrets.token_urlsafe(24)
+    # PKCE needs the same code_verifier during callback. If we don't keep it,
+    # Google returns: invalid_grant Missing code verifier.
     code_verifier = secrets.token_urlsafe(64)
     OAUTH_STATES[state] = {"user_id": update.effective_user.id, "code_verifier": code_verifier}
     flow = make_flow(state=state, code_verifier=code_verifier)
@@ -464,6 +414,8 @@ def oauth2callback():
     code_verifier = state_data.get("code_verifier")
     try:
         flow = make_flow(state=state, code_verifier=code_verifier)
+        # Some hosts pass the callback to Flask as http internally even though the public URL is https.
+        # OAuth requires https, so rebuild the callback from BASE_URL.
         authorization_response = f"{BASE_URL}/oauth2callback"
         if request.query_string:
             authorization_response += "?" + request.query_string.decode("utf-8")
@@ -485,6 +437,8 @@ def oauth2callback():
         return f"OAuth failed: {exc}", 500
 
 
+
+
 def parse_tags_text(raw: str | None) -> list[str] | None:
     if not raw:
         return None
@@ -493,6 +447,18 @@ def parse_tags_text(raw: str | None) -> list[str] | None:
 
 
 def parse_quick_details(text: str) -> dict[str, Any]:
+    """Parse optional one-message metadata.
+
+    Supported formats:
+      Title: My Song
+      Artist: Artist Name
+      YouTube: https://...
+      YT Title: Custom upload title
+      Description: custom desc
+      Tags: tag1, tag2
+
+    Also supports one-line: My Song | Artist Name | https://youtu.be/...
+    """
     data: dict[str, Any] = {}
     raw = (text or "").strip()
     if not raw:
@@ -533,6 +499,7 @@ def parse_quick_details(text: str) -> dict[str, Any]:
         if len(parts) > 2 and extract_youtube_url(parts[2]):
             data["youtube_url"] = extract_youtube_url(parts[2])
     elif not data:
+        # Treat plain text as title if no URL.
         if not url:
             data["song_name"] = raw
     if data.get("custom_tags_raw"):
@@ -541,6 +508,7 @@ def parse_quick_details(text: str) -> dict[str, Any]:
 
 
 async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """If all required inputs are present, dispatch GitHub worker."""
     data = context.user_data
     has_source = data.get("source_type") == "youtube_url" or bool(data.get("audio_file_id"))
     if not (data.get("song_name") and has_source and data.get("outro_file_id")):
@@ -577,6 +545,7 @@ async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_
         "custom_description": data.get("custom_description"),
         "custom_tags": data.get("custom_tags"),
     }
+    # Save a fallback job so /audio_retry can reuse all details if YouTube link fails.
     PENDING_RETRY_JOBS[user_id] = payload.copy()
     if USE_GITHUB_WORKER:
         await asyncio.to_thread(dispatch_github_worker, payload)
@@ -585,7 +554,6 @@ async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Local render mode me quick dispatch supported nahi. USE_GITHUB_WORKER=true recommended.")
     context.user_data.clear()
     return True
-
 
 async def new_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
@@ -633,7 +601,6 @@ async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "Agar artist add/replace karna ho: Artist: name bhej do."
     )
     return WAITING_LINK
-
 
 async def receive_artist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
@@ -714,6 +681,7 @@ async def collect_asset_or_text(update: Update, context: ContextTypes.DEFAULT_TY
         await maybe_dispatch_if_ready(update, context)
         return WAITING_LINK
 
+    # Photo/image = exact thumbnail now (not reference template)
     if msg.photo:
         context.user_data["thumbnail_file_id"] = msg.photo[-1].file_id
         context.user_data["thumbnail_ext"] = ".jpg"
@@ -766,11 +734,11 @@ async def collect_asset_or_text(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("Please text details, thumbnail image, audio file, ya outro video bhejo.")
     return WAITING_LINK
 
-
 async def receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
         return ConversationHandler.END
 
+    # Source can be a YouTube link OR an uploaded audio file.
     if update.message.text:
         text = update.message.text or ""
         url = extract_youtube_url(text)
@@ -821,7 +789,6 @@ async def receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "Ab apna 30–40 sec outro video bhejo as Telegram video/document."
     )
     return WAITING_OUTRO
-
 
 async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
@@ -950,6 +917,7 @@ async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
+
 async def audio_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await reject_if_unauthorized(update):
         return ConversationHandler.END
@@ -998,12 +966,92 @@ async def receive_retry_audio(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.clear()
     return ConversationHandler.END
 
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     if update.message:
         await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
+
+
+# ==================== DAILY TREND REPORT + APPROVE WORKFLOW ====================
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not ENABLE_RECOMMENDATIONS:
+        await update.message.reply_text("Trend recommendations are currently disabled.")
+        return
+
+    report_text = generate_daily_report()
+
+    keyboard = [
+        [InlineKeyboardButton("Approve Song", callback_data="approve_song")],
+        [InlineKeyboardButton("Refresh", callback_data="refresh_report")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(report_text, reply_markup=reply_markup)
+
+
+async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if not ENABLE_APPROVE_WORKFLOW:
+        await query.edit_message_text("Approve workflow is currently disabled.")
+        return
+
+    # Use a sample song from the report for demonstration
+    song_name = "Sample Trending Song"
+    artist = "Sample Artist"
+
+    # Generate SEO using existing function
+    metadata = generate_seo_metadata(song_name, artist, None)
+
+    # Prepare payload for existing pipeline
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    payload = {
+        "job_id": f"trend-{stamp}",
+        "chat_id": update.effective_chat.id,
+        "user_id": update.effective_user.id,
+        "song_name": song_name,
+        "artist": artist,
+        "source_type": "telegram_audio",  # Will be replaced by real audio later
+        "privacy": DEFAULT_PRIVACY,
+        "custom_title": metadata["title"],
+        "custom_description": metadata["description"],
+        "custom_tags": metadata["tags"],
+    }
+
+    # Reuse existing GitHub Actions dispatch (same as /new)
+    await asyncio.to_thread(dispatch_github_worker, payload)
+
+    await query.edit_message_text(
+        f"✅ Approved!\n\n"
+        f"Title: {metadata['title']}\n"
+        f"Privacy: {DEFAULT_PRIVACY}\n\n"
+        "🚀 Job sent to GitHub Actions. You will receive the private YouTube link here."
+    )
+
+
+async def refresh_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if not ENABLE_RECOMMENDATIONS:
+        await query.edit_message_text("Trend recommendations are currently disabled.")
+        return
+
+    report_text = generate_daily_report()
+    keyboard = [
+        [InlineKeyboardButton("Approve Song", callback_data="approve_song")],
+        [InlineKeyboardButton("Refresh", callback_data="refresh_report")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(report_text, reply_markup=reply_markup)
 
 
 def run_flask() -> None:
@@ -1023,6 +1071,7 @@ def build_telegram_app() -> Application:
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
         states={
+            # After /new accept title/details OR files in any order.
             WAITING_TITLE: [MessageHandler((filters.TEXT | filters.PHOTO | filters.AUDIO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, collect_asset_or_text)],
             WAITING_ARTIST: [
                 CommandHandler("skip", skip_artist),
@@ -1045,6 +1094,7 @@ def build_telegram_app() -> Application:
         app.add_handler(CommandHandler("daily_report", daily_report))
 
     if ENABLE_APPROVE_WORKFLOW:
+        from telegram.ext import CallbackQueryHandler
         app.add_handler(CallbackQueryHandler(approve_song_callback, pattern="^approve_song$"))
         app.add_handler(CallbackQueryHandler(refresh_report_callback, pattern="^refresh_report$"))
 
