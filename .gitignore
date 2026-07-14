@@ -1,13 +1,22 @@
-# Secrets / tokens
-client_secrets.json
-token.json
-*.credentials.json
-
-# Generated media
-outputs/
+# Database files
+storage/*.db
+storage/*.sqlite
+storage/*.sqlite3
+*.db
+*.sqlite
+*.sqlite3
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
-storage/trends.db
+venv/
+
+# Environment
+.env
+
+# Downloads
+telegram_downloads/
+outputs/
+tokens/

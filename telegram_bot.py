@@ -2424,3 +2424,17 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
+
+
+@flask_app.route("/db_status")
+def db_status():
+    """Show current database backend and persistence status."""
+    from agents.db import USE_POSTGRES, DATABASE_URL, DB_PATH
+    from pathlib import Path
+    return {
+        "backend": "postgresql" if USE_POSTGRES else "sqlite",
+        "database_url_set": bool(DATABASE_URL),
+        "sqlite_path": DB_PATH,
+        "sqlite_exists": Path(DB_PATH).exists(),
+        "persistence_warning": "SQLite is ephemeral on Render. Set DATABASE_URL env var to use PostgreSQL (Supabase/etc) for persistent storage.",
+    }
