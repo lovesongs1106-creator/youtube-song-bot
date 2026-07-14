@@ -962,13 +962,37 @@ async def handle_agentreach_text(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def agentreach_single_shot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Webhook-safe /agentreach that parses text in one shot and stores session in DB."""
+    """Webhook-safe /agentreach that parses text in one shot and stores session in DB.
+    
+    Supports:
+      /agentreach (shows instructions)
+      /agentreach Song 1 | https://...\nSong 2 | https://...
+      Plain text list (when used as general message handler)
+    """
     if await reject_if_unauthorized(update):
         return
     if not update.message or not update.message.text:
         return
 
     text = update.message.text.strip()
+    
+    # Strip /agentreach command prefix if present
+    if text.startswith("/agentreach"):
+        text = text[len("/agentreach"):].strip()
+    
+    if not text:
+        await update.message.reply_text(
+            "📥 Agent Reach Import\n\n"
+            "Send your song list in this format (same message as /agentreach):\n\n"
+            "/agentreach\n"
+            "Song Name 1 | https://youtube.com/watch?v=xxx\n"
+            "Song Name 2 | https://youtube.com/watch?v=yyy\n\n"
+            "Or paste the list directly after the command.\n"
+            "Maximum 100 songs.\n\n"
+            "You can also send a CSV file with columns: song_name,youtube_url"
+        )
+        return
+
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
     if len(lines) > 100:
@@ -2140,23 +2164,10 @@ def build_telegram_app() -> Application:
         outro_add_single_shot,
     ))
 
-    # Agent Reach conversation (polling mode)
+    # Agent Reach — webhook-safe single-shot (primary handler)
     if ENABLE_AGENTREACH_IMPORT:
-        agentreach_conv = ConversationHandler(
-            entry_points=[CommandHandler("agentreach", agentreach_start)],
-            states={
-                WAITING_AGENTREACH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_agentreach_text)],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-        )
-        app.add_handler(agentreach_conv)
-
-    # Webhook-safe single-shot agentreach (direct text after /agentreach command reply)
-    # We handle this via a dedicated command that expects immediate text in webhook mode
-    # Not needed if user uses ConversationHandler in polling; for webhook we rely on DB session callbacks
-
-    # CSV upload handler for Agent Reach
-    if ENABLE_AGENTREACH_IMPORT:
+        app.add_handler(CommandHandler("agentreach", agentreach_single_shot))
+        # CSV upload handler for Agent Reach
         app.add_handler(MessageHandler(
             filters.Document.FileExtension("csv") & ~filters.COMMAND,
             agentreach_csv_handler,
