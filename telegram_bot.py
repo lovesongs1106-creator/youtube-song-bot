@@ -61,6 +61,10 @@ from feature_flags import (
     ENABLE_TREND_AGENT,
     ENABLE_RECOMMENDATIONS,
     ENABLE_APPROVE_WORKFLOW,
+    ENABLE_AGENTREACH_IMPORT,
+    ENABLE_OUTRO_ROTATION_V2,
+    ENABLE_DASHBOARD,
+    ENABLE_SYSTEM_HEALTH,
 )
 
 from agents.viral_trend_engine import generate_daily_report, trend_debug_info, collect_and_save_trends, get_real_trends
@@ -72,7 +76,7 @@ from agents.outro_manager import (
     record_outro_usage,
     format_outro_list,
 )
-from agents.queue_manager import (
+from agents.queue_engine import (
     add_multiple_items,
     get_summary,
     get_queue,
@@ -80,9 +84,11 @@ from agents.queue_manager import (
     is_paused,
     set_paused,
     run_queue_processor,
+    add_queue_item,
 )
+from agents.db import init_all_tables, is_already_uploaded
 
-WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO, WAITING_RETRY_AUDIO = range(6)
+WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO, WAITING_RETRY_AUDIO, WAITING_OUTRO_VIDEO, WAITING_OUTRO_NAME, WAITING_OUTRO_WEIGHT, WAITING_AGENTREACH = range(10)
 
 ROOT = Path(__file__).parent.resolve()
 TOKENS_DIR = ROOT / "tokens"
@@ -595,6 +601,302 @@ async def queue_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def queue_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    count = cancel_all_pending()
+    await update.message.reply_text(f"🚫 Cancelled {count} pending item(s) from the queue.")
+
+
+
+
+# ==================== OUTRO CONVERSATION FLOW ====================
+
+async def outro_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start /outro_add conversation. Ask for video file."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.message:
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "📤 Outro Upload\n\n"
+        "Send your outro video as a Telegram video or document (MP4/MOV).\n"
+        "Max size: 500MB"
+    )
+    return WAITING_OUTRO_VIDEO
+
+
+async def receive_outro_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive outro video file."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.message:
+        return ConversationHandler.END
+
+    file_id = None
+    file_unique_id = None
+    ext = ".mp4"
+
+    if update.message.video:
+        file_id = update.message.video.file_id
+        file_unique_id = update.message.video.file_unique_id
+        ext = ".mp4"
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        file_unique_id = update.message.document.file_unique_id
+        name = update.message.document.file_name or "outro.mp4"
+        ext = Path(name).suffix or ".mp4"
+        mime = update.message.document.mime_type or ""
+        if not (ext in {".mp4", ".mov", ".mkv", ".webm"} or mime.startswith("video/")):
+            await update.message.reply_text("Please send a video file (MP4/MOV/MKV/WEBM).")
+            return WAITING_OUTRO_VIDEO
+    else:
+        await update.message.reply_text("Please send a video file.")
+        return WAITING_OUTRO_VIDEO
+
+    # Check file size (500MB max)
+    file_size = 0
+    if update.message.video:
+        file_size = update.message.video.file_size or 0
+    elif update.message.document:
+        file_size = update.message.document.file_size or 0
+    if file_size > 500 * 1024 * 1024:
+        await update.message.reply_text("❌ File too large. Maximum 500MB allowed.")
+        return ConversationHandler.END
+
+    context.user_data["outro_file_id"] = file_id
+    context.user_data["outro_file_unique_id"] = file_unique_id
+    context.user_data["outro_ext"] = ext
+
+    await update.message.reply_text(
+        "✅ Video received.\n\n"
+        "What name should I save this outro as?\n"
+        "Example: Summer Outro"
+    )
+    return WAITING_OUTRO_NAME
+
+
+async def receive_outro_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive outro name."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    name = (update.message.text or "").strip()
+    if not name:
+        await update.message.reply_text("Please enter a name.")
+        return WAITING_OUTRO_NAME
+
+    context.user_data["outro_name"] = name
+    await update.message.reply_text(
+        f"Got it: '{name}'\n\n"
+        "What weight for selection? (1-100)\n"
+        "Higher = more frequently selected.\n"
+        "Default: 10"
+    )
+    return WAITING_OUTRO_WEIGHT
+
+
+async def receive_outro_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive outro weight and save to database."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    try:
+        weight = int(update.message.text or "10")
+        if weight < 1 or weight > 100:
+            raise ValueError("Weight must be 1-100")
+    except ValueError:
+        await update.message.reply_text("Please enter a number between 1 and 100.")
+        return WAITING_OUTRO_WEIGHT
+
+    outro_id = add_outro(
+        name=context.user_data["outro_name"],
+        file_id=context.user_data["outro_file_id"],
+        ext=context.user_data["outro_ext"],
+        weight=weight,
+        file_unique_id=context.user_data.get("outro_file_unique_id"),
+    )
+
+    await update.message.reply_text(
+        f"✅ Outro added!\n\n"
+        f"ID: {outro_id}\n"
+        f"Name: {context.user_data['outro_name']}\n"
+        f"Weight: {weight}\n"
+        f"Ext: {context.user_data['outro_ext']}\n\n"
+        f"Total active outros: {len(list_outros())}"
+    )
+    return ConversationHandler.END
+
+
+# ==================== AGENT REACH IMPORT ====================
+
+async def agentreach_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start /agentreach command."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.message:
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "📥 Agent Reach Import\n\n"
+        "Paste your song list in this format:\n\n"
+        "Song Name | https://youtube.com/watch?v=xxx\n"
+        "Song Name 2 | https://youtube.com/watch?v=yyy\n\n"
+        "One song per line. Use | to separate name and URL.\n"
+        "Maximum 100 songs."
+    )
+    return WAITING_AGENTREACH
+
+
+async def handle_agentreach_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Parse Agent Reach pasted list."""
+    if not update.message or not update.message.text:
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    if len(lines) > 100:
+        await update.message.reply_text("❌ Too many songs. Maximum 100 allowed.")
+        return ConversationHandler.END
+
+    valid = []
+    invalid = []
+    duplicate = []
+    seen_urls = set()
+    seen_names = set()
+
+    for line in lines:
+        if "|" not in line:
+            invalid.append({"line": line, "reason": "Missing | separator"})
+            continue
+        parts = [p.strip() for p in line.split("|", 1)]
+        song_name = parts[0]
+        url = extract_youtube_url(parts[1]) if len(parts) > 1 else None
+
+        if not song_name:
+            invalid.append({"line": line, "reason": "Missing song name"})
+            continue
+        if not url:
+            invalid.append({"line": line, "reason": "Invalid or missing YouTube URL"})
+            continue
+
+        if url in seen_urls:
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate in batch"})
+            continue
+        if song_name.lower() in seen_names:
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate song name"})
+            continue
+
+        if is_already_uploaded(url):
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Already uploaded"})
+            continue
+
+        seen_urls.add(url)
+        seen_names.add(song_name.lower())
+        valid.append({"song_name": song_name, "youtube_url": url})
+
+    context.user_data["agentreach_candidates"] = valid
+    context.user_data["agentreach_invalid"] = invalid
+    context.user_data["agentreach_duplicate"] = duplicate
+
+    summary = (
+        f"📊 Agent Reach Summary\n\n"
+        f"Total lines: {len(lines)}\n"
+        f"✅ Valid: {len(valid)}\n"
+        f"❌ Invalid: {len(invalid)}\n"
+        f"🔄 Duplicate/Already Uploaded: {len(duplicate)}\n\n"
+    )
+    if valid:
+        summary += "Valid songs:\n"
+        for i, item in enumerate(valid[:10], 1):
+            summary += f"{i}. {item['song_name']}\n"
+        if len(valid) > 10:
+            summary += f"... and {len(valid) - 10} more\n"
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Add To Queue", callback_data="agentreach_confirm")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="agentreach_cancel")],
+    ]
+    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+    return ConversationHandler.END
+
+
+async def agentreach_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    candidates = context.user_data.get("agentreach_candidates", [])
+    if not candidates:
+        await query.edit_message_text("❌ No valid songs to add. Send /agentreach again.")
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    added_ids, rejected = add_multiple_items(user_id, chat_id, candidates, source="agentreach")
+
+    context.user_data.pop("agentreach_candidates", None)
+    context.user_data.pop("agentreach_invalid", None)
+    context.user_data.pop("agentreach_duplicate", None)
+
+    msg = f"✅ {len(added_ids)} songs added to upload queue!"
+    if rejected:
+        msg += f"\n⚠️ {len(rejected)} rejected (already uploaded or in queue)"
+    msg += "\n\nUse /queue_status to check progress."
+    await query.edit_message_text(msg)
+
+
+async def agentreach_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("agentreach_candidates", None)
+    context.user_data.pop("agentreach_invalid", None)
+    context.user_data.pop("agentreach_duplicate", None)
+    await query.edit_message_text("❌ Agent Reach import cancelled.")
+
+
+# ==================== QUEUE COMMANDS ====================
+
+async def queue_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    summary = get_summary()
+    paused = is_paused()
+    status_icon = "⏸️" if paused else "▶️"
+
+    text = (
+        f"{status_icon} Upload Queue Status\n\n"
+        f"Total: {summary['total']}\n"
+        f"⏳ Pending: {summary['pending']}\n"
+        f"🔄 Processing: {summary['processing']}\n"
+        f"✅ Completed: {summary['completed']}\n"
+        f"❌ Failed: {summary['failed']}\n"
+        f"🚫 Cancelled: {summary['cancelled']}\n\n"
+    )
+
+    if summary['pending'] > 0:
+        items = get_queue(status="pending", limit=5)
+        text += "Next up:\n"
+        for item in items:
+            text += f"  • {item['song_name'][:40]}\n"
+
+    await update.message.reply_text(text)
+
+
+async def queue_pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    set_paused(True)
+    await update.message.reply_text("⏸️ Queue paused. Current song will finish, then processing stops.")
+
+
+async def queue_resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    set_paused(False)
+    await update.message.reply_text("▶️ Queue resumed. Processing will continue shortly.")
+
+
+async def queue_cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
         return
     count = cancel_all_pending()
@@ -1358,14 +1660,41 @@ async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await update.message.reply_text("📡 Fetching trends... this may take a moment.")
-    report_text = await asyncio.to_thread(generate_daily_report)
+    
+    # Get trends with IDs for approve buttons
+    from agents.db import fetchall
+    trends = fetchall("SELECT * FROM trends ORDER BY opportunity_score DESC LIMIT 5")
+    
+    if not trends:
+        report_text = (
+            "📈 No trends found.\n\n"
+            "Run /trend_debug to diagnose."
+        )
+        await update.message.reply_text(report_text)
+        return
 
-    keyboard = [
-        [InlineKeyboardButton("Approve Song", callback_data="approve_song")],
-        [InlineKeyboardButton("Refresh", callback_data="refresh_report")],
-    ]
+    report_lines = ["📈 Today's Best Upload Opportunities\n"]
+    keyboard = []
+    
+    for i, trend in enumerate(trends, 1):
+        song = trend["song_name"][:50]
+        artist = trend.get("artist", "Unknown")[:30]
+        platform = trend.get("source_platform", "Unknown")
+        growth = trend.get("growth_score", 0)
+        opp = trend.get("opportunity_score", 0)
+        trend_id = trend["id"]
+        
+        report_lines.append(
+            f"{i}. {song}\n"
+            f"   🎤 {artist} | 📱 {platform}\n"
+            f"   📈 Growth: +{growth}% | 🎯 Opp: {opp}\n"
+        )
+        keyboard.append([InlineKeyboardButton(f"Approve #{i}", callback_data=f"approve_trend_{trend_id}")])
+    
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_report")])
+    
+    report_text = "\n".join(report_lines)
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(report_text, reply_markup=reply_markup)
 
 
@@ -1381,33 +1710,39 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 raise
         return
 
-    # Fetch the top trend from DB instead of using a hardcoded placeholder
-    trends = get_real_trends(1)
-    if not trends:
-        try:
-            await query.edit_message_text(
-                "❌ No trends available to approve.\n"
-                "Run /daily_report first to collect trends."
-            )
-        except Exception as e:
-            if "Message is not modified" not in str(e):
-                raise
+    # Parse trend_id from callback_data: "approve_trend_123"
+    callback_data = query.data or ""
+    try:
+        trend_id = int(callback_data.split("_")[-1])
+    except (ValueError, IndexError):
+        await query.edit_message_text("❌ Invalid trend selection.")
         return
 
-    song_name, artist, youtube_url, _score = trends[0]
+    # Load SPECIFIC trend by ID from database
+    from agents.db import fetchone
+    trend = fetchone("SELECT * FROM trends WHERE id = ?", (trend_id,))
+    if not trend:
+        await query.edit_message_text("❌ Trend not found. Run /daily_report to refresh.")
+        return
+
+    song_name = trend["song_name"]
+    artist = trend.get("artist", "")
+    youtube_url = trend["youtube_url"]
+
+    # DUPLICATE PROTECTION: Check uploads table
+    if is_already_uploaded(youtube_url):
+        await query.edit_message_text(f"❌ Already uploaded: {song_name}\n{youtube_url}")
+        return
+
     metadata = generate_seo_metadata(song_name, artist, youtube_url)
 
-    # Auto-select outro from rotation system
+    # Auto-select outro
     outro = select_outro()
     if not outro:
-        try:
-            await query.edit_message_text(
-                "❌ No outro videos available.\n"
-                "Use /outro_add to upload at least one outro video first."
-            )
-        except Exception as e:
-            if "Message is not modified" not in str(e):
-                raise
+        await query.edit_message_text(
+            "❌ No outro videos available.\n"
+            "Use /outro_add to upload at least one outro video first."
+        )
         return
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1433,10 +1768,10 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         await query.edit_message_text(
-            f"✅ Approved: {song_name}\n\n"
+            f"✅ Approved #{trend_id}: {song_name}\n\n"
             f"Title: {metadata['title']}\n"
             f"Privacy: {DEFAULT_PRIVACY}\n\n"
-            "🚀 Job sent to GitHub Actions. Audio will be downloaded from YouTube URL."
+            "🚀 Job sent to GitHub Actions."
         )
     except Exception as e:
         if "Message is not modified" not in str(e):
@@ -1526,10 +1861,13 @@ def build_telegram_app() -> Application:
 
     if ENABLE_APPROVE_WORKFLOW:
         from telegram.ext import CallbackQueryHandler
-        app.add_handler(CallbackQueryHandler(approve_song_callback, pattern="^approve_song$"))
+        app.add_handler(CallbackQueryHandler(approve_song_callback, pattern=r"^approve_trend_\d+$"))
         app.add_handler(CallbackQueryHandler(refresh_report_callback, pattern="^refresh_report$"))
-        app.add_handler(CallbackQueryHandler(bulk_confirm_callback, pattern="^bulk_confirm$"))
-        app.add_handler(CallbackQueryHandler(bulk_cancel_callback, pattern="^bulk_cancel$"))
+
+    if ENABLE_AGENTREACH_IMPORT:
+        from telegram.ext import CallbackQueryHandler
+        app.add_handler(CallbackQueryHandler(agentreach_confirm_callback, pattern="^agentreach_confirm$"))
+        app.add_handler(CallbackQueryHandler(agentreach_cancel_callback, pattern="^agentreach_cancel$"))
 
     return app
 
@@ -1548,6 +1886,10 @@ def main() -> None:
 
         def bot_loop_thread() -> None:
             global BOT_LOOP
+            # Initialize database tables first
+            init_all_tables()
+            print("[DB] All tables initialized", flush=True)
+            
             loop = asyncio.new_event_loop()
             BOT_LOOP = loop
             asyncio.set_event_loop(loop)
@@ -1556,6 +1898,7 @@ def main() -> None:
             loop.run_until_complete(telegram_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES))
             loop.run_until_complete(telegram_app.start())
             print(f"Telegram webhook set: {webhook_url}", flush=True)
+            
             # Start background queue processor
             asyncio.run_coroutine_threadsafe(
                 run_queue_processor(telegram_app.bot, DEFAULT_PRIVACY, dispatch_github_worker),
