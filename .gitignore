@@ -10,3 +10,4 @@ outputs/
 __pycache__/
 *.pyc
 .venv/
+storage/trends.db
