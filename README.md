@@ -143,3 +143,4 @@ python bot.py create-upload --song-name "Song" --youtube-url "https://www.youtub
 - The outro is automatically resized/padded to 1920×1080.
 - Category ID defaults to `10`, which is YouTube's Music category.
 - If your channel needs extra metadata, add it through `--description`, `--tags`, and `--title`.
+# Phase 2 deployed
