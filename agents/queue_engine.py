@@ -80,6 +80,122 @@ def add_multiple_items(user_id: int, chat_id: int, items: list[dict[str, str]], 
     return added, rejected
 
 
+def add_multiple_items_transactional(user_id: int, chat_id: int, items: list[dict[str, str]], source: str = "agentreach") -> dict[str, Any]:
+    """Transactional batch insert. ALL or NOTHING.
+    
+    Pre-flight checks each item for duplicates/already-uploaded using SAME connection.
+    If any item fails validation, NOTHING is inserted.
+    If DB error occurs mid-insert, full rollback.
+    
+    Returns:
+        {
+            "success": bool,
+            "added_ids": list[int],
+            "added_count": int,
+            "pending_total": int,
+            "rejected": list[dict],  # pre-flight rejections
+            "error": str | None,
+        }
+    """
+    from agents.db import get_connection
+    
+    result = {
+        "success": False,
+        "added_ids": [],
+        "added_count": 0,
+        "pending_total": 0,
+        "rejected": [],
+        "error": None,
+    }
+    
+    if not items:
+        result["error"] = "No items to insert"
+        return result
+    
+    if len(items) > 100:
+        result["error"] = "Maximum 100 songs per batch"
+        return result
+    
+    conn = get_connection()
+    try:
+        c = conn.cursor()
+        
+        # Pre-flight validation using SAME connection
+        seen_urls = set()
+        for item in items:
+            url = item.get("youtube_url", "").strip()
+            name = item.get("song_name", "").strip()
+            
+            if not name or not url:
+                result["rejected"].append({**item, "reason": "missing_name_or_url"})
+                continue
+            
+            if url in seen_urls:
+                result["rejected"].append({**item, "reason": "duplicate_in_batch"})
+                continue
+            seen_urls.add(url)
+            
+            # Check uploads table
+            c.execute("SELECT 1 FROM uploads WHERE youtube_url = ? LIMIT 1", (url,))
+            if c.fetchone():
+                result["rejected"].append({**item, "reason": "already_uploaded"})
+                continue
+            
+            # Check queue
+            c.execute(
+                "SELECT id FROM upload_queue WHERE youtube_url = ? AND status IN ('pending', 'processing') LIMIT 1",
+                (url,)
+            )
+            if c.fetchone():
+                result["rejected"].append({**item, "reason": "in_queue"})
+                continue
+        
+        # If any pre-flight rejections, abort entire batch
+        if result["rejected"]:
+            result["error"] = f"Pre-flight validation failed for {len(result['rejected'])} item(s). Entire batch rolled back."
+            conn.rollback()
+            return result
+        
+        # Transactional insert
+        now = datetime.now().isoformat()
+        added_ids = []
+        
+        for item in items:
+            url = item["youtube_url"].strip()
+            name = item["song_name"].strip()
+            
+            c.execute(
+                """INSERT INTO upload_queue (user_id, chat_id, song_name, youtube_url, status, source, created_at)
+                   VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                (user_id, chat_id, name, url, source, now),
+            )
+            item_id = c.lastrowid
+            added_ids.append(item_id)
+        
+        conn.commit()
+        
+        # Log actions after successful commit (best effort)
+        for item_id in added_ids:
+            _log_action(item_id, "added", f"source={source}")
+        
+        result["success"] = True
+        result["added_ids"] = added_ids
+        result["added_count"] = len(added_ids)
+        
+        # Get updated pending count
+        c.execute("SELECT COUNT(*) as cnt FROM upload_queue WHERE status = 'pending'")
+        row = c.fetchone()
+        result["pending_total"] = row[0] if row else 0
+        
+    except Exception as exc:
+        conn.rollback()
+        result["error"] = f"Transaction rolled back: {exc}"
+    finally:
+        conn.close()
+    
+    return result
+
+
 def get_next_pending() -> dict[str, Any] | None:
     """Get oldest pending item for processing."""
     return fetchone(

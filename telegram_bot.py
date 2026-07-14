@@ -78,6 +78,7 @@ from agents.outro_manager import (
 )
 from agents.queue_engine import (
     add_multiple_items,
+    add_multiple_items_transactional,
     get_summary,
     get_queue,
     cancel_all_pending,
@@ -805,37 +806,42 @@ async def outro_add_single_shot(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-# ==================== AGENT REACH IMPORT ====================
+# ==================== AGENT REACH IMPORT (PHASE 2) ====================
 
-async def agentreach_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start /agentreach command."""
-    if await reject_if_unauthorized(update):
-        return ConversationHandler.END
-    if not update.message:
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "📥 Agent Reach Import\n\n"
-        "Paste your song list in this format:\n\n"
-        "Song Name | https://youtube.com/watch?v=xxx\n"
-        "Song Name 2 | https://youtube.com/watch?v=yyy\n\n"
-        "One song per line. Use | to separate name and URL.\n"
-        "Maximum 100 songs."
+def _store_agentreach_session(user_id: int, candidates: list, invalid: list, duplicate: list, source: str = "text") -> str:
+    """Store agentreach session in DB for webhook-safe retrieval."""
+    import json, secrets
+    from agents.db import execute
+    session_id = secrets.token_urlsafe(16)
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"agentreach_{user_id}_{session_id}", json.dumps({
+            "candidates": candidates,
+            "invalid": invalid,
+            "duplicate": duplicate,
+            "source": source,
+            "created_at": dt.datetime.now().isoformat(),
+        }))
     )
-    return WAITING_AGENTREACH
+    return session_id
 
 
-async def handle_agentreach_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Parse Agent Reach pasted list."""
-    if not update.message or not update.message.text:
-        return ConversationHandler.END
+def _load_agentreach_session(user_id: int, session_id: str) -> dict | None:
+    import json
+    from agents.db import fetchone, execute
+    row = fetchone("SELECT value FROM system_state WHERE key = ?", (f"agentreach_{user_id}_{session_id}",))
+    if not row:
+        return None
+    execute("DELETE FROM system_state WHERE key = ?", (f"agentreach_{user_id}_{session_id}",))
+    return json.loads(row["value"])
 
-    text = update.message.text.strip()
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    if len(lines) > 100:
-        await update.message.reply_text("❌ Too many songs. Maximum 100 allowed.")
-        return ConversationHandler.END
-
+def _parse_agentreach_lines(lines: list[str]) -> tuple[list[dict], list[dict], list[dict]]:
+    """Parse and validate Agent Reach lines.
+    
+    Returns: (valid_items, invalid_items, duplicate_items)
+    """
     valid = []
     invalid = []
     duplicate = []
@@ -843,6 +849,9 @@ async def handle_agentreach_text(update: Update, context: ContextTypes.DEFAULT_T
     seen_names = set()
 
     for line in lines:
+        line = line.strip()
+        if not line:
+            continue
         if "|" not in line:
             invalid.append({"line": line, "reason": "Missing | separator"})
             continue
@@ -856,32 +865,39 @@ async def handle_agentreach_text(update: Update, context: ContextTypes.DEFAULT_T
         if not url:
             invalid.append({"line": line, "reason": "Invalid or missing YouTube URL"})
             continue
-
         if url in seen_urls:
-            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate in batch"})
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate URL in batch"})
             continue
         if song_name.lower() in seen_names:
-            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate song name"})
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate song name in batch"})
             continue
-
         if is_already_uploaded(url):
             duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Already uploaded"})
+            continue
+        # Check if already in queue (pending/processing)
+        existing = fetchone(
+            "SELECT id FROM upload_queue WHERE youtube_url = ? AND status IN ('pending', 'processing') LIMIT 1",
+            (url,)
+        )
+        if existing:
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Already in queue"})
             continue
 
         seen_urls.add(url)
         seen_names.add(song_name.lower())
         valid.append({"song_name": song_name, "youtube_url": url})
 
-    context.user_data["agentreach_candidates"] = valid
-    context.user_data["agentreach_invalid"] = invalid
-    context.user_data["agentreach_duplicate"] = duplicate
+    return valid, invalid, duplicate
 
+
+def _format_agentreach_summary(valid: list, invalid: list, duplicate: list, total_lines: int) -> str:
+    """Format the validation summary message."""
     summary = (
         f"📊 Agent Reach Summary\n\n"
-        f"Total lines: {len(lines)}\n"
+        f"📥 Total Songs: {total_lines}\n"
         f"✅ Valid: {len(valid)}\n"
         f"❌ Invalid: {len(invalid)}\n"
-        f"🔄 Duplicate/Already Uploaded: {len(duplicate)}\n\n"
+        f"🔄 Duplicates: {len(duplicate)}\n\n"
     )
     if valid:
         summary += "Valid songs:\n"
@@ -889,39 +905,60 @@ async def handle_agentreach_text(update: Update, context: ContextTypes.DEFAULT_T
             summary += f"{i}. {item['song_name']}\n"
         if len(valid) > 10:
             summary += f"... and {len(valid) - 10} more\n"
+    if invalid:
+        summary += "\n❌ Invalid entries:\n"
+        for item in invalid[:5]:
+            summary += f"• {item['line'][:40]}... ({item['reason']})\n"
+    if duplicate:
+        summary += "\n🔄 Duplicates:\n"
+        for item in duplicate[:5]:
+            summary += f"• {item['song_name'][:30]}... ({item['reason']})\n"
+    return summary
 
+
+async def agentreach_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start /agentreach command (Conversation mode for polling)."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.message:
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "📥 Agent Reach Import\n\n"
+        "Paste your song list in this format:\n\n"
+        "Song Name | https://youtube.com/watch?v=xxx\n"
+        "Song Name 2 | https://youtube.com/watch?v=yyy\n\n"
+        "One song per line. Use | to separate name and URL.\n"
+        "Maximum 100 songs.\n\n"
+        "Or send a CSV file with columns: song_name,youtube_url"
+    )
+    return WAITING_AGENTREACH
+
+
+async def handle_agentreach_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Parse Agent Reach pasted list (Conversation mode)."""
+    if not update.message or not update.message.text:
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    if len(lines) > 100:
+        await update.message.reply_text("❌ Too many songs. Maximum 100 allowed.")
+        return ConversationHandler.END
+
+    valid, invalid, duplicate = _parse_agentreach_lines(lines)
+
+    context.user_data["agentreach_candidates"] = valid
+    context.user_data["agentreach_invalid"] = invalid
+    context.user_data["agentreach_duplicate"] = duplicate
+
+    summary = _format_agentreach_summary(valid, invalid, duplicate, len(lines))
     keyboard = [
         [InlineKeyboardButton("✅ Add To Queue", callback_data="agentreach_confirm")],
         [InlineKeyboardButton("❌ Cancel", callback_data="agentreach_cancel")],
     ]
     await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
-
-
-# ── Webhook-safe Agent Reach using DB sessions ──
-
-def _store_agentreach_session(user_id: int, candidates: list, invalid: list, duplicate: list) -> str:
-    """Store agentreach session in DB for webhook-safe retrieval."""
-    import json, secrets
-    from agents.db import execute
-    session_id = secrets.token_urlsafe(16)
-    execute(
-        """INSERT INTO system_state (key, value) VALUES (?, ?)
-           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-        (f"agentreach_{user_id}_{session_id}", json.dumps({"candidates": candidates, "invalid": invalid, "duplicate": duplicate}))
-    )
-    return session_id
-
-
-def _load_agentreach_session(user_id: int, session_id: str) -> dict | None:
-    import json
-    from agents.db import fetchone, execute
-    row = fetchone("SELECT value FROM system_state WHERE key = ?", (f"agentreach_{user_id}_{session_id}",))
-    if not row:
-        return None
-    # Clean up
-    execute("DELETE FROM system_state WHERE key = ?", (f"agentreach_{user_id}_{session_id}",))
-    return json.loads(row["value"])
 
 
 async def agentreach_single_shot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -938,56 +975,11 @@ async def agentreach_single_shot(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Too many songs. Maximum 100 allowed.")
         return
 
-    valid = []
-    invalid = []
-    duplicate = []
-    seen_urls = set()
-    seen_names = set()
-
-    for line in lines:
-        if "|" not in line:
-            invalid.append({"line": line, "reason": "Missing | separator"})
-            continue
-        parts = [p.strip() for p in line.split("|", 1)]
-        song_name = parts[0]
-        url = extract_youtube_url(parts[1]) if len(parts) > 1 else None
-
-        if not song_name:
-            invalid.append({"line": line, "reason": "Missing song name"})
-            continue
-        if not url:
-            invalid.append({"line": line, "reason": "Invalid or missing YouTube URL"})
-            continue
-        if url in seen_urls:
-            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate in batch"})
-            continue
-        if song_name.lower() in seen_names:
-            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate song name"})
-            continue
-        if is_already_uploaded(url):
-            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Already uploaded"})
-            continue
-        seen_urls.add(url)
-        seen_names.add(song_name.lower())
-        valid.append({"song_name": song_name, "youtube_url": url})
-
+    valid, invalid, duplicate = _parse_agentreach_lines(lines)
     user_id = update.effective_user.id
-    session_id = _store_agentreach_session(user_id, valid, invalid, duplicate)
+    session_id = _store_agentreach_session(user_id, valid, invalid, duplicate, source="text")
 
-    summary = (
-        f"📊 Agent Reach Summary\n\n"
-        f"Total lines: {len(lines)}\n"
-        f"✅ Valid: {len(valid)}\n"
-        f"❌ Invalid: {len(invalid)}\n"
-        f"🔄 Duplicate/Already Uploaded: {len(duplicate)}\n\n"
-    )
-    if valid:
-        summary += "Valid songs:\n"
-        for i, item in enumerate(valid[:10], 1):
-            summary += f"{i}. {item['song_name']}\n"
-        if len(valid) > 10:
-            summary += f"... and {len(valid) - 10} more\n"
-
+    summary = _format_agentreach_summary(valid, invalid, duplicate, len(lines))
     keyboard = [
         [InlineKeyboardButton("✅ Add To Queue", callback_data=f"ar_confirm_{session_id}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"ar_cancel_{session_id}")],
@@ -995,7 +987,68 @@ async def agentreach_single_shot(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+async def agentreach_csv_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle CSV document upload for Agent Reach."""
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message or not update.message.document:
+        return
+
+    doc = update.message.document
+    name = doc.file_name or ""
+    if not name.lower().endswith(".csv"):
+        await update.message.reply_text("❌ Please send a CSV file (.csv extension).")
+        return
+
+    # Download CSV
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        csv_path = TELEGRAM_DOWNLOADS_DIR / f"agentreach_{doc.file_id}.csv"
+        await tg_file.download_to_drive(custom_path=str(csv_path))
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Failed to download CSV: {exc}")
+        return
+
+    # Parse CSV
+    import csv
+    lines = []
+    try:
+        with csv_path.open("r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) >= 2:
+                    song_name = row[0].strip()
+                    url = row[1].strip()
+                    lines.append(f"{song_name} | {url}")
+                elif len(row) == 1 and row[0].strip():
+                    # Maybe tab-separated or malformed
+                    lines.append(row[0].strip())
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Failed to parse CSV: {exc}")
+        return
+    finally:
+        csv_path.unlink(missing_ok=True)
+
+    if len(lines) > 100:
+        await update.message.reply_text("❌ Too many songs in CSV. Maximum 100 allowed.")
+        return
+
+    valid, invalid, duplicate = _parse_agentreach_lines(lines)
+    user_id = update.effective_user.id
+    session_id = _store_agentreach_session(user_id, valid, invalid, duplicate, source="csv")
+
+    summary = _format_agentreach_summary(valid, invalid, duplicate, len(lines))
+    keyboard = [
+        [InlineKeyboardButton("✅ Add To Queue", callback_data=f"ar_confirm_{session_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"ar_cancel_{session_id}")],
+    ]
+    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ── Callbacks ──
+
 async def agentreach_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Legacy polling-mode confirm."""
     query = update.callback_query
     await query.answer()
 
@@ -1006,21 +1059,27 @@ async def agentreach_confirm_callback(update: Update, context: ContextTypes.DEFA
 
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    added_ids, rejected = add_multiple_items(user_id, chat_id, candidates, source="agentreach")
+    result = add_multiple_items_transactional(user_id, chat_id, candidates, source="agentreach")
 
     context.user_data.pop("agentreach_candidates", None)
     context.user_data.pop("agentreach_invalid", None)
     context.user_data.pop("agentreach_duplicate", None)
 
-    msg = f"✅ {len(added_ids)} songs added to upload queue!"
-    if rejected:
-        msg += f"\n⚠️ {len(rejected)} rejected (already uploaded or in queue)"
-    msg += "\n\nUse /queue_status to check progress."
+    if result["success"]:
+        msg = (
+            f"✅ {result['added_count']} songs added to upload queue!\n\n"
+            f"⏳ Pending Count: {result['pending_total']}\n"
+            f"📦 Queue IDs: {', '.join(str(i) for i in result['added_ids'][:5])}"
+            f"{'...' if len(result['added_ids']) > 5 else ''}\n\n"
+            f"Use /queue_status to check progress."
+        )
+    else:
+        msg = f"❌ Batch failed:\n{result.get('error', 'Unknown error')}\n\nNo items were added."
     await query.edit_message_text(msg)
 
 
 async def agentreach_db_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Webhook-safe confirm using DB session."""
+    """Webhook-safe confirm using DB session + transactional insert."""
     query = update.callback_query
     await query.answer()
 
@@ -1038,12 +1097,18 @@ async def agentreach_db_confirm_callback(update: Update, context: ContextTypes.D
         return
 
     chat_id = update.effective_chat.id
-    added_ids, rejected = add_multiple_items(user_id, chat_id, candidates, source="agentreach")
+    result = add_multiple_items_transactional(user_id, chat_id, candidates, source="agentreach")
 
-    msg = f"✅ {len(added_ids)} songs added to upload queue!"
-    if rejected:
-        msg += f"\n⚠️ {len(rejected)} rejected (already uploaded or in queue)"
-    msg += "\n\nUse /queue_status to check progress."
+    if result["success"]:
+        msg = (
+            f"✅ {result['added_count']} songs added to upload queue!\n\n"
+            f"⏳ Pending Count: {result['pending_total']}\n"
+            f"📦 Queue IDs: {', '.join(str(i) for i in result['added_ids'][:5])}"
+            f"{'...' if len(result['added_ids']) > 5 else ''}\n\n"
+            f"Use /queue_status to check progress."
+        )
+    else:
+        msg = f"❌ Batch failed:\n{result.get('error', 'Unknown error')}\n\nNo items were added."
     await query.edit_message_text(msg)
 
 
@@ -1054,11 +1119,12 @@ async def agentreach_db_cancel_callback(update: Update, context: ContextTypes.DE
     callback_data = query.data or ""
     session_id = callback_data.replace("ar_cancel_", "")
     user_id = update.effective_user.id
-    _load_agentreach_session(user_id, session_id)  # loads and deletes
+    _load_agentreach_session(user_id, session_id)
     await query.edit_message_text("❌ Agent Reach import cancelled.")
 
 
 async def agentreach_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Legacy polling-mode cancel."""
     query = update.callback_query
     await query.answer()
     context.user_data.pop("agentreach_candidates", None)
@@ -2088,6 +2154,13 @@ def build_telegram_app() -> Application:
     # Webhook-safe single-shot agentreach (direct text after /agentreach command reply)
     # We handle this via a dedicated command that expects immediate text in webhook mode
     # Not needed if user uses ConversationHandler in polling; for webhook we rely on DB session callbacks
+
+    # CSV upload handler for Agent Reach
+    if ENABLE_AGENTREACH_IMPORT:
+        app.add_handler(MessageHandler(
+            filters.Document.FileExtension("csv") & ~filters.COMMAND,
+            agentreach_csv_handler,
+        ))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
