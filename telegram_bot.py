@@ -689,7 +689,7 @@ def diag():
     queue_summary = get_summary()
     return {
         "status": "ok",
-        "commit": "3279c76",
+        "commit": "63b98dd",
         "yt_dlp_version": _yt_dlp_version(),
         "db_path": DB_PATH,
         "db_exists": db_exists,
