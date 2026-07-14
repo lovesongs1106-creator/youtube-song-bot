@@ -991,7 +991,7 @@ def diag():
     queue_summary = get_summary()
     return {
         "status": "ok",
-        "commit": "63b98dd",
+        "commit": "780f258",
         "yt_dlp_version": _yt_dlp_version(),
         "db_path": DB_PATH,
         "db_exists": db_exists,
@@ -1014,6 +1014,10 @@ def diag():
             "ENABLE_TREND_AGENT": ENABLE_TREND_AGENT,
             "ENABLE_RECOMMENDATIONS": ENABLE_RECOMMENDATIONS,
             "ENABLE_APPROVE_WORKFLOW": ENABLE_APPROVE_WORKFLOW,
+            "ENABLE_AGENTREACH_IMPORT": ENABLE_AGENTREACH_IMPORT,
+            "ENABLE_OUTRO_ROTATION_V2": ENABLE_OUTRO_ROTATION_V2,
+            "ENABLE_DASHBOARD": ENABLE_DASHBOARD,
+            "ENABLE_SYSTEM_HEALTH": ENABLE_SYSTEM_HEALTH,
         },
         "github_worker": USE_GITHUB_WORKER,
         "github_repo": normalize_github_repo(GITHUB_REPO) if GITHUB_REPO else None,
