@@ -35,7 +35,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -44,6 +44,7 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
+    CallbackQueryHandler,
 )
 
 from bot import (
@@ -453,35 +454,37 @@ async def outro_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-# ==================== BULK UPLOAD QUEUE COMMANDS ====================
+# ==================== BULK UPLOAD QUEUE COMMANDS (WEBHOOK-SAFE) ====================
 
-async def bulk_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await reject_if_unauthorized(update):
-        return
-    if not update.message:
-        return
-    context.user_data["awaiting_bulk"] = True
-    context.user_data.pop("bulk_candidates", None)
-    await update.message.reply_text(
-        "📥 Bulk Upload Mode\n\n"
-        "Send a list of songs in this format:\n\n"
-        "Song Name 1 | https://youtube.com/watch?v=abc\n"
-        "Song Name 2 | https://youtube.com/watch?v=def\n"
-        "Song Name 3 | https://youtube.com/watch?v=ghi\n\n"
-        "One song per line. Use | to separate name and URL."
+def _store_bulk_session(user_id: int, candidates: list, invalid: list) -> str:
+    """Store bulk upload session in DB for webhook-safe retrieval."""
+    import json, secrets
+    from agents.db import execute
+    session_id = secrets.token_urlsafe(16)
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"bulk_{user_id}_{session_id}", json.dumps({
+            "candidates": candidates,
+            "invalid": invalid,
+            "created_at": dt.datetime.now().isoformat(),
+        }))
     )
+    return session_id
 
 
-async def handle_bulk_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages when user is in bulk upload mode."""
-    if not update.message or not update.message.text:
-        return
-    if not context.user_data.get("awaiting_bulk"):
-        return
+def _load_bulk_session(user_id: int, session_id: str) -> dict | None:
+    import json
+    from agents.db import fetchone, execute
+    row = fetchone("SELECT value FROM system_state WHERE key = ?", (f"bulk_{user_id}_{session_id}",))
+    if not row:
+        return None
+    execute("DELETE FROM system_state WHERE key = ?", (f"bulk_{user_id}_{session_id}",))
+    return json.loads(row["value"])
 
-    text = update.message.text.strip()
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
 
+def _parse_bulk_lines(lines: list[str]) -> tuple[list[dict], list[tuple]]:
+    """Parse bulk upload lines. Returns (valid_items, invalid_items)."""
     valid = []
     invalid = []
     for line in lines:
@@ -498,10 +501,69 @@ async def handle_bulk_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             invalid.append((line, "Invalid or missing YouTube URL"))
             continue
         valid.append({"song_name": song_name, "youtube_url": url})
+    return valid, invalid
 
-    context.user_data["bulk_candidates"] = valid
-    context.user_data["bulk_invalid"] = invalid
-    context.user_data["awaiting_bulk"] = False
+
+async def bulk_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe /bulk_upload — stores awaiting flag in DB."""
+    print("[BULK_UPLOAD_START] command received", flush=True)
+    if await reject_if_unauthorized(update):
+        print("[BULK_UPLOAD_START] unauthorized", flush=True)
+        return
+    if not update.message:
+        print("[BULK_UPLOAD_START] no message", flush=True)
+        return
+    user_id = update.effective_user.id
+    # Store awaiting flag in DB (webhook-safe)
+    from agents.db import execute
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"bulk_awaiting_{user_id}", "true")
+    )
+    print(f"[BULK_UPLOAD_START] awaiting flag set for user={user_id}", flush=True)
+    await update.message.reply_text(
+        "📥 Bulk Upload Mode\n\n"
+        "Send a list of songs in this format:\n\n"
+        "Song Name 1 | https://youtube.com/watch?v=abc\n"
+        "Song Name 2 | https://youtube.com/watch?v=def\n"
+        "Song Name 3 | https://youtube.com/watch?v=ghi\n\n"
+        "One song per line. Use | to separate name and URL."
+    )
+
+
+async def handle_bulk_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages when user is in bulk upload mode. Webhook-safe via DB."""
+    print("[BULK_UPLOAD_RECEIVED] text handler triggered", flush=True)
+    if not update.message or not update.message.text:
+        print("[BULK_UPLOAD_RECEIVED] no text", flush=True)
+        return
+
+    user_id = update.effective_user.id
+    # Check DB for awaiting flag (webhook-safe)
+    from agents.db import fetchone, execute
+    awaiting_row = fetchone(
+        "SELECT value FROM system_state WHERE key = ?",
+        (f"bulk_awaiting_{user_id}",)
+    )
+    if not awaiting_row or awaiting_row.get("value") != "true":
+        print(f"[BULK_UPLOAD_RECEIVED] user={user_id} not awaiting bulk", flush=True)
+        return
+
+    print(f"[BULK_UPLOAD_RECEIVED] user={user_id} is awaiting, parsing...", flush=True)
+    text = update.message.text.strip()
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    print(f"[BULK_UPLOAD_PARSED] {len(lines)} lines", flush=True)
+
+    valid, invalid = _parse_bulk_lines(lines)
+    print(f"[BULK_UPLOAD_PARSED] valid={len(valid)} invalid={len(invalid)}", flush=True)
+
+    # Clear awaiting flag
+    execute("DELETE FROM system_state WHERE key = ?", (f"bulk_awaiting_{user_id}",))
+
+    # Store session for confirm/callback
+    session_id = _store_bulk_session(user_id, valid, invalid)
+    print(f"[BULK_UPLOAD_PARSED] session_id={session_id}", flush=True)
 
     summary = (
         f"📊 Bulk Upload Summary\n\n"
@@ -521,27 +583,36 @@ async def handle_bulk_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             summary += f"• {item[:40]}... ({reason})\n"
 
     keyboard = [
-        [InlineKeyboardButton("✅ Confirm Upload", callback_data="bulk_confirm")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="bulk_cancel")],
+        [InlineKeyboardButton("✅ Confirm Upload", callback_data=f"bulk_confirm_{session_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"bulk_cancel_{session_id}")],
     ]
     await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def bulk_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe bulk confirm using DB session."""
+    print("[BULK_UPLOAD_QUEUE_INSERT] confirm callback", flush=True)
     query = update.callback_query
     await query.answer()
 
-    candidates = context.user_data.get("bulk_candidates", [])
-    if not candidates:
-        await query.edit_message_text("❌ No valid songs to upload. Send /bulk_upload again.")
+    callback_data = query.data or ""
+    session_id = callback_data.replace("bulk_confirm_", "")
+    user_id = update.effective_user.id
+    session = _load_bulk_session(user_id, session_id)
+    if not session:
+        print(f"[BULK_UPLOAD_QUEUE_INSERT] session not found: {session_id}", flush=True)
+        await query.edit_message_text("❌ Session expired. Send /bulk_upload again.")
         return
 
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    ids = add_multiple_items(user_id, chat_id, candidates)
+    candidates = session.get("candidates", [])
+    if not candidates:
+        await query.edit_message_text("❌ No valid songs to upload.")
+        return
 
-    context.user_data.pop("bulk_candidates", None)
-    context.user_data.pop("bulk_invalid", None)
+    chat_id = update.effective_chat.id
+    print(f"[BULK_UPLOAD_QUEUE_INSERT] adding {len(candidates)} items", flush=True)
+    ids = add_multiple_items(user_id, chat_id, candidates)
+    print(f"[BULK_UPLOAD_QUEUE_INSERT] added_ids={ids}", flush=True)
 
     await query.edit_message_text(
         f"✅ {len(ids)} songs added to upload queue!\n\n"
@@ -551,10 +622,14 @@ async def bulk_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def bulk_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe bulk cancel using DB session."""
+    print("[BULK_UPLOAD_CANCEL] cancel callback", flush=True)
     query = update.callback_query
     await query.answer()
-    context.user_data.pop("bulk_candidates", None)
-    context.user_data.pop("bulk_invalid", None)
+    callback_data = query.data or ""
+    session_id = callback_data.replace("bulk_cancel_", "")
+    user_id = update.effective_user.id
+    _load_bulk_session(user_id, session_id)  # load + delete
     await query.edit_message_text("❌ Bulk upload cancelled.")
 
 
@@ -1962,8 +2037,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 # ==================== DAILY TREND REPORT + APPROVE WORKFLOW ====================
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
 async def trend_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
         return
@@ -2152,6 +2225,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("queue_pause", queue_pause_cmd))
     app.add_handler(CommandHandler("queue_resume", queue_resume_cmd))
     app.add_handler(CommandHandler("queue_cancel", queue_cancel_cmd))
+    app.add_handler(CommandHandler("bulk_upload", bulk_upload))
 
     # Outro add conversation (polling mode)
     outro_conv = ConversationHandler(
@@ -2212,13 +2286,15 @@ def build_telegram_app() -> Application:
         app.add_handler(CommandHandler("daily_report", daily_report))
         print("DAILY REPORT HANDLER REGISTERED")
 
+    if ENABLE_BULK_UPLOAD:
+        app.add_handler(CallbackQueryHandler(bulk_confirm_callback, pattern=r"^bulk_confirm_"))
+        app.add_handler(CallbackQueryHandler(bulk_cancel_callback, pattern=r"^bulk_cancel_"))
+
     if ENABLE_APPROVE_WORKFLOW:
-        from telegram.ext import CallbackQueryHandler
         app.add_handler(CallbackQueryHandler(approve_song_callback, pattern=r"^approve_trend_\d+$"))
         app.add_handler(CallbackQueryHandler(refresh_report_callback, pattern="^refresh_report$"))
 
     if ENABLE_AGENTREACH_IMPORT:
-        from telegram.ext import CallbackQueryHandler
         # Legacy polling-mode callbacks
         app.add_handler(CallbackQueryHandler(agentreach_confirm_callback, pattern="^agentreach_confirm$"))
         app.add_handler(CallbackQueryHandler(agentreach_cancel_callback, pattern="^agentreach_cancel$"))
