@@ -1265,6 +1265,13 @@ async def refresh_report_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text(report_text, reply_markup=reply_markup)
 
 
+    return {
+        "outros": outros,
+        "history": history,
+        "trends": trends,
+    }
+
+
 def run_flask() -> None:
     port = int(os.environ.get("PORT", "8080"))
     flask_app.run(host="0.0.0.0", port=port)
@@ -1356,28 +1363,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-@flask_app.route("/raw")
-def raw():
-    """Temporary raw data dump for audit."""
-    import sqlite3
-    from pathlib import Path
-    db = Path("storage/trends.db")
-    if not db.exists():
-        return {"error": "DB not found"}
-    conn = sqlite3.connect(str(db))
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    
-    c.execute("SELECT id, name, file_id, weight, is_active, added_at FROM outros WHERE is_active = 1 ORDER BY id")
-    outros = [dict(r) for r in c.fetchall()]
-    
-    c.execute("SELECT id, outro_id, job_id, used_at FROM outro_history ORDER BY used_at DESC LIMIT 10")
-    history = [dict(r) for r in c.fetchall()]
-    
-    c.execute("SELECT song_name, artist, platform, source_url, opportunity_score FROM viral_trends ORDER BY opportunity_score DESC LIMIT 3")
-    trends = [dict(r) for r in c.fetchall()]
-    
-    conn.close()
-    return {"outros": outros, "history": history, "trends": trends}
