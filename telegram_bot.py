@@ -1821,18 +1821,36 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("github_test", github_test))
     app.add_handler(CommandHandler("audio_retry", audio_retry))
     app.add_handler(CommandHandler("trend_debug", trend_debug))
-    app.add_handler(CommandHandler("outro_add", outro_add))
     app.add_handler(CommandHandler("outro_list", outro_list))
     app.add_handler(CommandHandler("outro_remove", outro_remove))
     app.add_handler(CommandHandler("outro_test", outro_test))
-    app.add_handler(CommandHandler("bulk_upload", bulk_upload))
-    app.add_handler(CommandHandler("queue_status", queue_status))
-    app.add_handler(CommandHandler("queue_pause", queue_pause))
-    app.add_handler(CommandHandler("queue_resume", queue_resume))
-    app.add_handler(CommandHandler("queue_cancel", queue_cancel))
+    app.add_handler(CommandHandler("queue_status", queue_status_cmd))
+    app.add_handler(CommandHandler("queue_pause", queue_pause_cmd))
+    app.add_handler(CommandHandler("queue_resume", queue_resume_cmd))
+    app.add_handler(CommandHandler("queue_cancel", queue_cancel_cmd))
 
-    # General text handler for bulk upload mode (runs after ConversationHandler)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bulk_text))
+    # Outro add conversation
+    outro_conv = ConversationHandler(
+        entry_points=[CommandHandler("outro_add", outro_add_start)],
+        states={
+            WAITING_OUTRO_VIDEO: [MessageHandler((filters.VIDEO | filters.Document.VIDEO | filters.Document.ALL) & ~filters.COMMAND, receive_outro_video)],
+            WAITING_OUTRO_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_outro_name)],
+            WAITING_OUTRO_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_outro_weight)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(outro_conv)
+
+    # Agent Reach conversation
+    if ENABLE_AGENTREACH_IMPORT:
+        agentreach_conv = ConversationHandler(
+            entry_points=[CommandHandler("agentreach", agentreach_start)],
+            states={
+                WAITING_AGENTREACH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_agentreach_text)],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+        app.add_handler(agentreach_conv)
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
