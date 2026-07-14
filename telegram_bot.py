@@ -72,6 +72,15 @@ from agents.outro_manager import (
     record_outro_usage,
     format_outro_list,
 )
+from agents.queue_manager import (
+    add_multiple_items,
+    get_summary,
+    get_queue,
+    cancel_all_pending,
+    is_paused,
+    set_paused,
+    run_queue_processor,
+)
 
 WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO, WAITING_RETRY_AUDIO = range(6)
 
@@ -310,6 +319,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Commands:\n"
         "/auth - YouTube channel connect karo\n"
         "/new - Naya video banao aur upload karo\n"
+        "/bulk_upload - Multiple songs queue karo\n"
+        "/queue_status - Upload queue dekho\n"
+        "/queue_pause - Queue roko\n"
+        "/queue_resume - Queue chalao\n"
+        "/queue_cancel - Pending items cancel karo\n"
         "/daily_report - Viral trends dekho\n"
         "/trend_debug - Trend engine diagnostics\n"
         "/outro_add - Outro video add karo\n"
@@ -432,6 +446,161 @@ async def outro_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+# ==================== BULK UPLOAD QUEUE COMMANDS ====================
+
+async def bulk_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    context.user_data["awaiting_bulk"] = True
+    context.user_data.pop("bulk_candidates", None)
+    await update.message.reply_text(
+        "📥 Bulk Upload Mode\n\n"
+        "Send a list of songs in this format:\n\n"
+        "Song Name 1 | https://youtube.com/watch?v=abc\n"
+        "Song Name 2 | https://youtube.com/watch?v=def\n"
+        "Song Name 3 | https://youtube.com/watch?v=ghi\n\n"
+        "One song per line. Use | to separate name and URL."
+    )
+
+
+async def handle_bulk_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages when user is in bulk upload mode."""
+    if not update.message or not update.message.text:
+        return
+    if not context.user_data.get("awaiting_bulk"):
+        return
+
+    text = update.message.text.strip()
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    valid = []
+    invalid = []
+    for line in lines:
+        if "|" not in line:
+            invalid.append((line, "Missing | separator"))
+            continue
+        parts = [p.strip() for p in line.split("|", 1)]
+        song_name = parts[0]
+        url = extract_youtube_url(parts[1]) if len(parts) > 1 else None
+        if not song_name:
+            invalid.append((line, "Missing song name"))
+            continue
+        if not url:
+            invalid.append((line, "Invalid or missing YouTube URL"))
+            continue
+        valid.append({"song_name": song_name, "youtube_url": url})
+
+    context.user_data["bulk_candidates"] = valid
+    context.user_data["bulk_invalid"] = invalid
+    context.user_data["awaiting_bulk"] = False
+
+    summary = (
+        f"📊 Bulk Upload Summary\n\n"
+        f"Total lines: {len(lines)}\n"
+        f"✅ Valid: {len(valid)}\n"
+        f"❌ Invalid: {len(invalid)}\n\n"
+    )
+    if valid:
+        summary += "Valid songs:\n"
+        for i, item in enumerate(valid[:10], 1):
+            summary += f"{i}. {item['song_name']}\n"
+        if len(valid) > 10:
+            summary += f"... and {len(valid) - 10} more\n"
+    if invalid:
+        summary += "\nInvalid entries:\n"
+        for item, reason in invalid[:5]:
+            summary += f"• {item[:40]}... ({reason})\n"
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Confirm Upload", callback_data="bulk_confirm")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="bulk_cancel")],
+    ]
+    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def bulk_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    candidates = context.user_data.get("bulk_candidates", [])
+    if not candidates:
+        await query.edit_message_text("❌ No valid songs to upload. Send /bulk_upload again.")
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    ids = add_multiple_items(user_id, chat_id, candidates)
+
+    context.user_data.pop("bulk_candidates", None)
+    context.user_data.pop("bulk_invalid", None)
+
+    await query.edit_message_text(
+        f"✅ {len(ids)} songs added to upload queue!\n\n"
+        f"Use /queue_status to check progress.\n"
+        f"The queue processor will start automatically."
+    )
+
+
+async def bulk_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("bulk_candidates", None)
+    context.user_data.pop("bulk_invalid", None)
+    await query.edit_message_text("❌ Bulk upload cancelled.")
+
+
+async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    summary = get_summary()
+    paused = is_paused()
+    status_icon = "⏸️" if paused else "▶️"
+
+    text = (
+        f"{status_icon} Upload Queue Status\n\n"
+        f"Total: {summary['total']}\n"
+        f"⏳ Pending: {summary['pending']}\n"
+        f"🔄 Processing: {summary['processing']}\n"
+        f"✅ Completed: {summary['completed']}\n"
+        f"❌ Failed: {summary['failed']}\n"
+        f"🚫 Cancelled: {summary['cancelled']}\n\n"
+    )
+
+    if summary['pending'] > 0:
+        items = get_queue(status="pending", limit=5)
+        text += "Next up:\n"
+        for item in items:
+            text += f"  • {item['song_name'][:40]}\n"
+
+    await update.message.reply_text(text)
+
+
+async def queue_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    set_paused(True)
+    await update.message.reply_text("⏸️ Queue paused. Current song will finish, then processing stops.")
+
+
+async def queue_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    set_paused(False)
+    await update.message.reply_text("▶️ Queue resumed. Processing will continue shortly.")
+
+
+async def queue_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    count = cancel_all_pending()
+    await update.message.reply_text(f"🚫 Cancelled {count} pending item(s) from the queue.")
+
+
 async def github_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
         return
@@ -508,14 +677,16 @@ def home():
 
 @flask_app.route("/diag")
 def diag():
-    """Production diagnostic endpoint. Returns trend engine and outro status."""
+    """Production diagnostic endpoint. Returns trend engine, outro, and queue status."""
     from agents.viral_trend_engine import _yt_dlp_version, get_viral_trends, DB_PATH
     from agents.outro_manager import list_outros, get_last_used_outro_ids
+    from agents.queue_manager import get_summary, is_paused
     from pathlib import Path
     db_exists = Path(DB_PATH).exists()
     trends = get_viral_trends(5)
     outros = list_outros()
     last_used = get_last_used_outro_ids(3)
+    queue_summary = get_summary()
     return {
         "status": "ok",
         "commit": "3279c76",
@@ -532,6 +703,10 @@ def diag():
             "count": len(outros),
             "last_used_ids": last_used,
             "items": [{"id": o.id, "name": o.name, "weight": o.weight} for o in outros],
+        },
+        "queue": {
+            "paused": is_paused(),
+            **queue_summary,
         },
         "feature_flags": {
             "ENABLE_TREND_AGENT": ENABLE_TREND_AGENT,
@@ -1311,6 +1486,14 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("outro_list", outro_list))
     app.add_handler(CommandHandler("outro_remove", outro_remove))
     app.add_handler(CommandHandler("outro_test", outro_test))
+    app.add_handler(CommandHandler("bulk_upload", bulk_upload))
+    app.add_handler(CommandHandler("queue_status", queue_status))
+    app.add_handler(CommandHandler("queue_pause", queue_pause))
+    app.add_handler(CommandHandler("queue_resume", queue_resume))
+    app.add_handler(CommandHandler("queue_cancel", queue_cancel))
+
+    # General text handler for bulk upload mode (runs after ConversationHandler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bulk_text))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
@@ -1345,6 +1528,8 @@ def build_telegram_app() -> Application:
         from telegram.ext import CallbackQueryHandler
         app.add_handler(CallbackQueryHandler(approve_song_callback, pattern="^approve_song$"))
         app.add_handler(CallbackQueryHandler(refresh_report_callback, pattern="^refresh_report$"))
+        app.add_handler(CallbackQueryHandler(bulk_confirm_callback, pattern="^bulk_confirm$"))
+        app.add_handler(CallbackQueryHandler(bulk_cancel_callback, pattern="^bulk_cancel$"))
 
     return app
 
@@ -1371,6 +1556,12 @@ def main() -> None:
             loop.run_until_complete(telegram_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES))
             loop.run_until_complete(telegram_app.start())
             print(f"Telegram webhook set: {webhook_url}", flush=True)
+            # Start background queue processor
+            asyncio.run_coroutine_threadsafe(
+                run_queue_processor(telegram_app.bot, DEFAULT_PRIVACY, dispatch_github_worker),
+                loop,
+            )
+            print("[QUEUE] Background processor scheduled", flush=True)
             loop.run_forever()
 
         thread = threading.Thread(target=bot_loop_thread, daemon=True)
