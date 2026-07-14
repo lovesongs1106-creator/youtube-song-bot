@@ -969,46 +969,54 @@ async def agentreach_single_shot(update: Update, context: ContextTypes.DEFAULT_T
       /agentreach Song 1 | https://...\nSong 2 | https://...
       Plain text list (when used as general message handler)
     """
-    if await reject_if_unauthorized(update):
-        return
-    if not update.message or not update.message.text:
-        return
+    try:
+        if await reject_if_unauthorized(update):
+            return
+        if not update.message or not update.message.text:
+            return
 
-    text = update.message.text.strip()
-    
-    # Strip /agentreach command prefix if present
-    if text.startswith("/agentreach"):
-        text = text[len("/agentreach"):].strip()
-    
-    if not text:
-        await update.message.reply_text(
-            "📥 Agent Reach Import\n\n"
-            "Send your song list in this format (same message as /agentreach):\n\n"
-            "/agentreach\n"
-            "Song Name 1 | https://youtube.com/watch?v=xxx\n"
-            "Song Name 2 | https://youtube.com/watch?v=yyy\n\n"
-            "Or paste the list directly after the command.\n"
-            "Maximum 100 songs.\n\n"
-            "You can also send a CSV file with columns: song_name,youtube_url"
-        )
-        return
+        text = update.message.text.strip()
+        
+        # Strip /agentreach command prefix if present
+        if text.startswith("/agentreach"):
+            text = text[len("/agentreach"):].strip()
+        
+        if not text:
+            await update.message.reply_text(
+                "📥 Agent Reach Import\n\n"
+                "Send your song list in this format (same message as /agentreach):\n\n"
+                "/agentreach\n"
+                "Song Name 1 | https://youtube.com/watch?v=xxx\n"
+                "Song Name 2 | https://youtube.com/watch?v=yyy\n\n"
+                "Or paste the list directly after the command.\n"
+                "Maximum 100 songs.\n\n"
+                "You can also send a CSV file with columns: song_name,youtube_url"
+            )
+            return
 
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    if len(lines) > 100:
-        await update.message.reply_text("❌ Too many songs. Maximum 100 allowed.")
-        return
+        if len(lines) > 100:
+            await update.message.reply_text("❌ Too many songs. Maximum 100 allowed.")
+            return
 
-    valid, invalid, duplicate = _parse_agentreach_lines(lines)
-    user_id = update.effective_user.id
-    session_id = _store_agentreach_session(user_id, valid, invalid, duplicate, source="text")
+        valid, invalid, duplicate = _parse_agentreach_lines(lines)
+        user_id = update.effective_user.id
+        session_id = _store_agentreach_session(user_id, valid, invalid, duplicate, source="text")
 
-    summary = _format_agentreach_summary(valid, invalid, duplicate, len(lines))
-    keyboard = [
-        [InlineKeyboardButton("✅ Add To Queue", callback_data=f"ar_confirm_{session_id}")],
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"ar_cancel_{session_id}")],
-    ]
-    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+        summary = _format_agentreach_summary(valid, invalid, duplicate, len(lines))
+        keyboard = [
+            [InlineKeyboardButton("✅ Add To Queue", callback_data=f"ar_confirm_{session_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"ar_cancel_{session_id}")],
+        ]
+        await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as exc:
+        import traceback
+        error_msg = f"❌ Agent Reach error:\n{exc}\n\n{traceback.format_exc()[:500]}"
+        if update.message:
+            await update.message.reply_text(error_msg)
+        else:
+            print(error_msg, flush=True)
 
 
 async def agentreach_csv_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1104,36 +1112,43 @@ async def agentreach_confirm_callback(update: Update, context: ContextTypes.DEFA
 
 async def agentreach_db_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Webhook-safe confirm using DB session + transactional insert."""
-    query = update.callback_query
-    await query.answer()
+    try:
+        query = update.callback_query
+        await query.answer()
 
-    callback_data = query.data or ""
-    session_id = callback_data.replace("ar_confirm_", "")
-    user_id = update.effective_user.id
-    session = _load_agentreach_session(user_id, session_id)
-    if not session:
-        await query.edit_message_text("❌ Session expired. Send /agentreach again.")
-        return
+        callback_data = query.data or ""
+        session_id = callback_data.replace("ar_confirm_", "")
+        user_id = update.effective_user.id
+        session = _load_agentreach_session(user_id, session_id)
+        if not session:
+            await query.edit_message_text("❌ Session expired. Send /agentreach again.")
+            return
 
-    candidates = session.get("candidates", [])
-    if not candidates:
-        await query.edit_message_text("❌ No valid songs to add.")
-        return
+        candidates = session.get("candidates", [])
+        if not candidates:
+            await query.edit_message_text("❌ No valid songs to add.")
+            return
 
-    chat_id = update.effective_chat.id
-    result = add_multiple_items_transactional(user_id, chat_id, candidates, source="agentreach")
+        chat_id = update.effective_chat.id
+        result = add_multiple_items_transactional(user_id, chat_id, candidates, source="agentreach")
 
-    if result["success"]:
-        msg = (
-            f"✅ {result['added_count']} songs added to upload queue!\n\n"
-            f"⏳ Pending Count: {result['pending_total']}\n"
-            f"📦 Queue IDs: {', '.join(str(i) for i in result['added_ids'][:5])}"
-            f"{'...' if len(result['added_ids']) > 5 else ''}\n\n"
-            f"Use /queue_status to check progress."
-        )
-    else:
-        msg = f"❌ Batch failed:\n{result.get('error', 'Unknown error')}\n\nNo items were added."
-    await query.edit_message_text(msg)
+        if result["success"]:
+            msg = (
+                f"✅ {result['added_count']} songs added to upload queue!\n\n"
+                f"⏳ Pending Count: {result['pending_total']}\n"
+                f"📦 Queue IDs: {', '.join(str(i) for i in result['added_ids'][:5])}"
+                f"{'...' if len(result['added_ids']) > 5 else ''}\n\n"
+                f"Use /queue_status to check progress."
+            )
+        else:
+            msg = f"❌ Batch failed:\n{result.get('error', 'Unknown error')}\n\nNo items were added."
+        await query.edit_message_text(msg)
+    except Exception as exc:
+        import traceback
+        error_msg = f"❌ Confirm error:\n{exc}\n\n{traceback.format_exc()[:500]}"
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.message.reply_text(error_msg)
+        print(error_msg, flush=True)
 
 
 async def agentreach_db_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
