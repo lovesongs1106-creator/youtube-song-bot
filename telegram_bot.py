@@ -2294,6 +2294,19 @@ def debug_agentreach():
         return {"error": str(exc), "trace": traceback.format_exc()}, 500
 
 
+@flask_app.route("/create_session", methods=["POST"])
+def create_session():
+    """Create a test session for debug purposes."""
+    try:
+        user_id = request.json.get("user_id", 1768510980)
+        candidates = request.json.get("candidates", [])
+        session_id = _store_agentreach_session(user_id, candidates, [], [], source="api_test")
+        return {"session_id": session_id, "candidates": len(candidates)}
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
+
 @flask_app.route("/debug_callback", methods=["POST"])
 def debug_callback():
     """Debug endpoint to test Agent Reach confirm callback without Telegram."""
