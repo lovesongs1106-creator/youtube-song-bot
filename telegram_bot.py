@@ -1874,6 +1874,9 @@ def build_telegram_app() -> Application:
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cancel))
 
+    # General text handler (lowest priority, catches remaining text)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bulk_text))
+
     print(f"ENABLE_RECOMMENDATIONS value: {ENABLE_RECOMMENDATIONS}")
 
     if ENABLE_RECOMMENDATIONS:
