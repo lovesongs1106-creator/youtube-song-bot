@@ -2262,17 +2262,21 @@ def verify():
 @flask_app.route("/debug_agentreach", methods=["POST"])
 def debug_agentreach():
     """Debug endpoint to test Agent Reach parsing without Telegram."""
-    text = request.json.get("text", "")
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    if text.startswith("/agentreach"):
-        lines = [l.strip() for l in text[len("/agentreach"):].split("\n") if l.strip()]
-    valid, invalid, duplicate = _parse_agentreach_lines(lines)
-    return {
-        "total": len(lines),
-        "valid": valid,
-        "invalid": invalid,
-        "duplicate": duplicate,
-    }
+    try:
+        text = request.json.get("text", "") if request.json else ""
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        if text.startswith("/agentreach"):
+            lines = [l.strip() for l in text[len("/agentreach"):].split("\n") if l.strip()]
+        valid, invalid, duplicate = _parse_agentreach_lines(lines)
+        return {
+            "total": len(lines),
+            "valid": valid,
+            "invalid": invalid,
+            "duplicate": duplicate,
+        }
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
 
 
 @flask_app.route("/seed_trends", methods=["POST"])
