@@ -63,7 +63,7 @@ from feature_flags import (
     ENABLE_APPROVE_WORKFLOW,
 )
 
-from agents.simple_trend import generate_daily_report
+from agents.simple_trend import generate_daily_report, trend_debug_info, collect_and_save_trends, get_real_trends
 
 WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO, WAITING_RETRY_AUDIO = range(6)
 
@@ -977,6 +977,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+async def trend_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    await update.message.reply_text("🔍 Running trend diagnostics... this may take 30–60s.")
+    try:
+        report = await asyncio.to_thread(trend_debug_info)
+        # Telegram max message length ~4096; split safely
+        for i in range(0, len(report), 3900):
+            chunk = report[i : i + 3900]
+            await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+    except Exception as exc:
+        await update.message.reply_text(f"❌ trend_debug error:\n{exc}")
+
+
 async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
         return
@@ -984,7 +1000,8 @@ async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Trend recommendations are currently disabled.")
         return
 
-    report_text = generate_daily_report()
+    await update.message.reply_text("📡 Fetching trends... this may take a moment.")
+    report_text = await asyncio.to_thread(generate_daily_report)
 
     keyboard = [
         [InlineKeyboardButton("Approve Song", callback_data="approve_song")],
@@ -1007,11 +1024,20 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 raise
         return
 
-    # Trend approval payload - uses YouTube URL for audio (no manual upload)
-    song_name = "Sample Trending Song"
-    artist = "Sample Artist"
-    youtube_url = "https://www.youtube.com/watch?v=dQw4w9wgccc"  # Placeholder - replace with real trend URL later
+    # Fetch the top trend from DB instead of using a hardcoded placeholder
+    trends = get_real_trends(1)
+    if not trends:
+        try:
+            await query.edit_message_text(
+                "❌ No trends available to approve.\n"
+                "Run /daily_report first to collect trends."
+            )
+        except Exception as e:
+            if "Message is not modified" not in str(e):
+                raise
+        return
 
+    song_name, artist, youtube_url, _score = trends[0]
     metadata = generate_seo_metadata(song_name, artist, youtube_url)
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1021,7 +1047,7 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
         "user_id": update.effective_user.id,
         "song_name": song_name,
         "artist": artist,
-        "source_type": "youtube_url",      # Trend workflow uses YouTube URL
+        "source_type": "youtube_url",
         "youtube_url": youtube_url,
         "privacy": DEFAULT_PRIVACY,
         "custom_title": metadata["title"],
@@ -1033,7 +1059,7 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         await query.edit_message_text(
-            f"✅ Approved!\n\n"
+            f"✅ Approved: {song_name}\n\n"
             f"Title: {metadata['title']}\n"
             f"Privacy: {DEFAULT_PRIVACY}\n\n"
             "🚀 Job sent to GitHub Actions. Audio will be downloaded from YouTube URL."
@@ -1051,7 +1077,7 @@ async def refresh_report_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("Trend recommendations are currently disabled.")
         return
 
-    report_text = generate_daily_report()
+    report_text = await asyncio.to_thread(generate_daily_report)
     keyboard = [
         [InlineKeyboardButton("Approve Song", callback_data="approve_song")],
         [InlineKeyboardButton("Refresh", callback_data="refresh_report")],
@@ -1074,6 +1100,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("export_youtube_token", export_youtube_token))
     app.add_handler(CommandHandler("github_test", github_test))
     app.add_handler(CommandHandler("audio_retry", audio_retry))
+    app.add_handler(CommandHandler("trend_debug", trend_debug))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
@@ -1106,7 +1133,7 @@ def build_telegram_app() -> Application:
 
     if ENABLE_APPROVE_WORKFLOW:
         from telegram.ext import CallbackQueryHandler
-        app.add_handler(CallbackQueryHandler(approve_song_callback, pattern="^approve_trend_"))
+        app.add_handler(CallbackQueryHandler(approve_song_callback, pattern="^approve_song$"))
         app.add_handler(CallbackQueryHandler(refresh_report_callback, pattern="^refresh_report$"))
 
     return app
