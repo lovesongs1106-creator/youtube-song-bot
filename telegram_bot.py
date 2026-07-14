@@ -390,6 +390,34 @@ def home():
     return "YouTube Song Telegram Bot is running. Open Telegram and use /start."
 
 
+@flask_app.route("/diag")
+def diag():
+    """Production diagnostic endpoint. Returns trend engine status."""
+    from agents.simple_trend import _yt_dlp_version, get_real_trends, DB_PATH
+    from pathlib import Path
+    db_exists = Path(DB_PATH).exists()
+    trends = get_real_trends(5)
+    return {
+        "status": "ok",
+        "commit": "440ff7f",
+        "yt_dlp_version": _yt_dlp_version(),
+        "db_path": DB_PATH,
+        "db_exists": db_exists,
+        "db_trend_count": len(trends),
+        "trends": [
+            {"song": t[0], "artist": t[1], "url": t[2], "score": t[3]}
+            for t in trends
+        ],
+        "feature_flags": {
+            "ENABLE_TREND_AGENT": ENABLE_TREND_AGENT,
+            "ENABLE_RECOMMENDATIONS": ENABLE_RECOMMENDATIONS,
+            "ENABLE_APPROVE_WORKFLOW": ENABLE_APPROVE_WORKFLOW,
+        },
+        "github_worker": USE_GITHUB_WORKER,
+        "github_repo": normalize_github_repo(GITHUB_REPO) if GITHUB_REPO else None,
+    }
+
+
 @flask_app.route(f"/telegram/{WEBHOOK_SECRET}", methods=["POST"])
 def telegram_webhook():
     if telegram_app is None:
