@@ -611,6 +611,8 @@ async def queue_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # ==================== OUTRO CONVERSATION FLOW ====================
 
+# ==================== OUTRO SINGLE-SHOT (WEBHOOK-SAFE) ====================
+
 async def outro_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start /outro_add conversation. Ask for video file."""
     if await reject_if_unauthorized(update):
@@ -725,6 +727,84 @@ async def receive_outro_weight(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+async def outro_add_single_shot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe single-shot outro upload.
+    
+    Usage: Send a video/document with caption:
+      /outro_add My Outro Name 10
+    Or reply to a video with:
+      /outro_add My Outro Name 10
+    """
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    # Try to get video from message or replied message
+    target_msg = update.message
+    if update.message.reply_to_message:
+        target_msg = update.message.reply_to_message
+
+    file_id = None
+    file_unique_id = None
+    ext = ".mp4"
+    file_size = 0
+
+    if target_msg.video:
+        file_id = target_msg.video.file_id
+        file_unique_id = target_msg.video.file_unique_id
+        ext = ".mp4"
+        file_size = target_msg.video.file_size or 0
+    elif target_msg.document:
+        file_id = target_msg.document.file_id
+        file_unique_id = target_msg.document.file_unique_id
+        name = target_msg.document.file_name or "outro.mp4"
+        ext = Path(name).suffix or ".mp4"
+        mime = target_msg.document.mime_type or ""
+        file_size = target_msg.document.file_size or 0
+        if not (ext in {".mp4", ".mov", ".mkv", ".webm"} or mime.startswith("video/")):
+            await update.message.reply_text("❌ Replied message is not a video file.")
+            return
+    else:
+        await update.message.reply_text(
+            "📤 Outro Upload (Webhook Mode)\n\n"
+            "Send a video with caption:\n"
+            "`/outro_add Outro Name 10`\n\n"
+            "Or reply to a video with:\n"
+            "`/outro_add Outro Name 10`"
+        )
+        return
+
+    if file_size > 500 * 1024 * 1024:
+        await update.message.reply_text("❌ File too large. Maximum 500MB allowed.")
+        return
+
+    # Parse name and weight from args
+    args = context.args or []
+    weight = 10
+    name = "Outro"
+    if args:
+        # Last arg might be weight
+        if len(args) > 1 and args[-1].isdigit():
+            weight = int(args[-1])
+            name = " ".join(args[:-1])
+        else:
+            name = " ".join(args)
+    else:
+        name = Path(target_msg.document.file_name if target_msg.document else "outro").stem or "Outro"
+
+    outro_id = add_outro(name=name, file_id=file_id, ext=ext, weight=weight, file_unique_id=file_unique_id)
+    await update.message.reply_text(
+        f"✅ Outro added!\n\n"
+        f"ID: {outro_id}\n"
+        f"Name: {name}\n"
+        f"Weight: {weight}\n"
+        f"File ID: `{file_id}`\n"
+        f"Ext: {ext}\n\n"
+        f"Total active outros: {len(list_outros())}"
+    )
+
+
 # ==================== AGENT REACH IMPORT ====================
 
 async def agentreach_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -818,6 +898,103 @@ async def handle_agentreach_text(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 
+# ── Webhook-safe Agent Reach using DB sessions ──
+
+def _store_agentreach_session(user_id: int, candidates: list, invalid: list, duplicate: list) -> str:
+    """Store agentreach session in DB for webhook-safe retrieval."""
+    import json, secrets
+    from agents.db import execute
+    session_id = secrets.token_urlsafe(16)
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"agentreach_{user_id}_{session_id}", json.dumps({"candidates": candidates, "invalid": invalid, "duplicate": duplicate}))
+    )
+    return session_id
+
+
+def _load_agentreach_session(user_id: int, session_id: str) -> dict | None:
+    import json
+    from agents.db import fetchone, execute
+    row = fetchone("SELECT value FROM system_state WHERE key = ?", (f"agentreach_{user_id}_{session_id}",))
+    if not row:
+        return None
+    # Clean up
+    execute("DELETE FROM system_state WHERE key = ?", (f"agentreach_{user_id}_{session_id}",))
+    return json.loads(row["value"])
+
+
+async def agentreach_single_shot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe /agentreach that parses text in one shot and stores session in DB."""
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    if len(lines) > 100:
+        await update.message.reply_text("❌ Too many songs. Maximum 100 allowed.")
+        return
+
+    valid = []
+    invalid = []
+    duplicate = []
+    seen_urls = set()
+    seen_names = set()
+
+    for line in lines:
+        if "|" not in line:
+            invalid.append({"line": line, "reason": "Missing | separator"})
+            continue
+        parts = [p.strip() for p in line.split("|", 1)]
+        song_name = parts[0]
+        url = extract_youtube_url(parts[1]) if len(parts) > 1 else None
+
+        if not song_name:
+            invalid.append({"line": line, "reason": "Missing song name"})
+            continue
+        if not url:
+            invalid.append({"line": line, "reason": "Invalid or missing YouTube URL"})
+            continue
+        if url in seen_urls:
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate in batch"})
+            continue
+        if song_name.lower() in seen_names:
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate song name"})
+            continue
+        if is_already_uploaded(url):
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Already uploaded"})
+            continue
+        seen_urls.add(url)
+        seen_names.add(song_name.lower())
+        valid.append({"song_name": song_name, "youtube_url": url})
+
+    user_id = update.effective_user.id
+    session_id = _store_agentreach_session(user_id, valid, invalid, duplicate)
+
+    summary = (
+        f"📊 Agent Reach Summary\n\n"
+        f"Total lines: {len(lines)}\n"
+        f"✅ Valid: {len(valid)}\n"
+        f"❌ Invalid: {len(invalid)}\n"
+        f"🔄 Duplicate/Already Uploaded: {len(duplicate)}\n\n"
+    )
+    if valid:
+        summary += "Valid songs:\n"
+        for i, item in enumerate(valid[:10], 1):
+            summary += f"{i}. {item['song_name']}\n"
+        if len(valid) > 10:
+            summary += f"... and {len(valid) - 10} more\n"
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Add To Queue", callback_data=f"ar_confirm_{session_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"ar_cancel_{session_id}")],
+    ]
+    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
 async def agentreach_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -840,6 +1017,45 @@ async def agentreach_confirm_callback(update: Update, context: ContextTypes.DEFA
         msg += f"\n⚠️ {len(rejected)} rejected (already uploaded or in queue)"
     msg += "\n\nUse /queue_status to check progress."
     await query.edit_message_text(msg)
+
+
+async def agentreach_db_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe confirm using DB session."""
+    query = update.callback_query
+    await query.answer()
+
+    callback_data = query.data or ""
+    session_id = callback_data.replace("ar_confirm_", "")
+    user_id = update.effective_user.id
+    session = _load_agentreach_session(user_id, session_id)
+    if not session:
+        await query.edit_message_text("❌ Session expired. Send /agentreach again.")
+        return
+
+    candidates = session.get("candidates", [])
+    if not candidates:
+        await query.edit_message_text("❌ No valid songs to add.")
+        return
+
+    chat_id = update.effective_chat.id
+    added_ids, rejected = add_multiple_items(user_id, chat_id, candidates, source="agentreach")
+
+    msg = f"✅ {len(added_ids)} songs added to upload queue!"
+    if rejected:
+        msg += f"\n⚠️ {len(rejected)} rejected (already uploaded or in queue)"
+    msg += "\n\nUse /queue_status to check progress."
+    await query.edit_message_text(msg)
+
+
+async def agentreach_db_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe cancel using DB session."""
+    query = update.callback_query
+    await query.answer()
+    callback_data = query.data or ""
+    session_id = callback_data.replace("ar_cancel_", "")
+    user_id = update.effective_user.id
+    _load_agentreach_session(user_id, session_id)  # loads and deletes
+    await query.edit_message_text("❌ Agent Reach import cancelled.")
 
 
 async def agentreach_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -977,6 +1193,17 @@ def home():
     return "YouTube Song Telegram Bot is running. Open Telegram and use /start."
 
 
+def _get_commit_hash() -> str:
+    import subprocess, os
+    env_hash = os.environ.get("RENDER_GIT_COMMIT", "").strip()
+    if env_hash:
+        return env_hash[:7]
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
+
+
 @flask_app.route("/diag")
 def diag():
     """Production diagnostic endpoint. Returns trend engine, outro, and queue status."""
@@ -991,7 +1218,7 @@ def diag():
     queue_summary = get_summary()
     return {
         "status": "ok",
-        "commit": "780f258",
+        "commit": _get_commit_hash(),
         "yt_dlp_version": _yt_dlp_version(),
         "db_path": DB_PATH,
         "db_exists": db_exists,
@@ -1829,7 +2056,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("queue_resume", queue_resume_cmd))
     app.add_handler(CommandHandler("queue_cancel", queue_cancel_cmd))
 
-    # Outro add conversation
+    # Outro add conversation (polling mode)
     outro_conv = ConversationHandler(
         entry_points=[CommandHandler("outro_add", outro_add_start)],
         states={
@@ -1841,7 +2068,13 @@ def build_telegram_app() -> Application:
     )
     app.add_handler(outro_conv)
 
-    # Agent Reach conversation
+    # Webhook-safe single-shot outro handler (higher priority for video+caption)
+    app.add_handler(MessageHandler(
+        (filters.VIDEO | filters.Document.VIDEO | filters.Document.ALL) & filters.CaptionRegex(r"^/outro_add") & ~filters.COMMAND,
+        outro_add_single_shot,
+    ))
+
+    # Agent Reach conversation (polling mode)
     if ENABLE_AGENTREACH_IMPORT:
         agentreach_conv = ConversationHandler(
             entry_points=[CommandHandler("agentreach", agentreach_start)],
@@ -1851,6 +2084,10 @@ def build_telegram_app() -> Application:
             fallbacks=[CommandHandler("cancel", cancel)],
         )
         app.add_handler(agentreach_conv)
+
+    # Webhook-safe single-shot agentreach (direct text after /agentreach command reply)
+    # We handle this via a dedicated command that expects immediate text in webhook mode
+    # Not needed if user uses ConversationHandler in polling; for webhook we rely on DB session callbacks
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
@@ -1891,8 +2128,12 @@ def build_telegram_app() -> Application:
 
     if ENABLE_AGENTREACH_IMPORT:
         from telegram.ext import CallbackQueryHandler
+        # Legacy polling-mode callbacks
         app.add_handler(CallbackQueryHandler(agentreach_confirm_callback, pattern="^agentreach_confirm$"))
         app.add_handler(CallbackQueryHandler(agentreach_cancel_callback, pattern="^agentreach_cancel$"))
+        # Webhook-safe DB session callbacks
+        app.add_handler(CallbackQueryHandler(agentreach_db_confirm_callback, pattern=r"^ar_confirm_"))
+        app.add_handler(CallbackQueryHandler(agentreach_db_cancel_callback, pattern=r"^ar_cancel_"))
 
     return app
 
@@ -1932,6 +2173,67 @@ def verify():
     result["system_state"] = fetchall("SELECT key, value FROM system_state")
     
     return result
+
+
+@flask_app.route("/seed_trends", methods=["POST"])
+def seed_trends():
+    """Seed test trends for Phase 1 verification. Protected by webhook secret."""
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if secret != WEBHOOK_SECRET:
+        return {"error": "Unauthorized"}, 401
+    
+    from agents.db import execute
+    from datetime import datetime
+    
+    test_trends = [
+        ("Test Song Alpha", "Artist A", "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube", 85.5, 120.0, 30.0, 95.0),
+        ("Test Song Beta", "Artist B", "https://www.youtube.com/watch?v=9bZkp7q19f0", "youtube", 72.0, 95.0, 45.0, 80.0),
+        ("Test Song Gamma", "Artist C", "https://www.youtube.com/watch?v=kfVsfOSbJY0", "youtube", 60.0, 80.0, 20.0, 75.0),
+    ]
+    
+    for song, artist, url, platform, viral, growth, competition, opp in test_trends:
+        execute(
+            """INSERT INTO trends (song_name, artist, youtube_url, source_platform, viral_score, growth_score, competition_score, opportunity_score, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (song, artist, url, platform, viral, growth, competition, opp, dt.datetime.now().isoformat())
+        )
+    
+    return {"status": "ok", "seeded": len(test_trends)}
+
+
+@flask_app.route("/test_dispatch", methods=["POST"])
+def test_dispatch():
+    """Trigger a test GitHub Actions dispatch for verification."""
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if secret != WEBHOOK_SECRET:
+        return {"error": "Unauthorized"}, 401
+    
+    from agents.outro_manager import select_outro
+    outro = select_outro()
+    if not outro:
+        return {"error": "No outro available"}, 400
+    
+    payload = {
+        "job_id": "verify-test-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "chat_id": 1768510980,
+        "user_id": 1768510980,
+        "song_name": "Verification Test Song",
+        "artist": "Test Artist",
+        "source_type": "youtube_url",
+        "youtube_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "privacy": "private",
+        "custom_title": "Verification Test Upload",
+        "custom_description": "This is a test dispatch for Phase 1 verification.",
+        "custom_tags": ["test", "verification"],
+        "outro_file_id": outro["file_id"],
+        "outro_ext": outro["ext"],
+    }
+    
+    try:
+        dispatch_github_worker(payload)
+        return {"status": "dispatched", "job_id": payload["job_id"], "outro_file_id": outro["file_id"]}
+    except Exception as exc:
+        return {"error": str(exc)}, 500
 
 def main() -> None:
     global telegram_app
