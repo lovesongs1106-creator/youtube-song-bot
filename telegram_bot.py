@@ -2421,9 +2421,6 @@ def main() -> None:
         telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-if __name__ == "__main__":
-    main()
-
 
 
 @flask_app.route("/db_status")
@@ -2438,3 +2435,46 @@ def db_status():
         "sqlite_exists": Path(DB_PATH).exists(),
         "persistence_warning": "SQLite is ephemeral on Render. Set DATABASE_URL env var to use PostgreSQL (Supabase/etc) for persistent storage.",
     }
+
+
+@flask_app.route("/debug_agentreach", methods=["POST"])
+def debug_agentreach():
+    """Debug endpoint to test Agent Reach parsing without Telegram."""
+    try:
+        text = request.json.get("text", "") if request.json else ""
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        if text.startswith("/agentreach"):
+            lines = [l.strip() for l in text[len("/agentreach"):].split("\n") if l.strip()]
+        valid, invalid, duplicate = _parse_agentreach_lines(lines)
+        return {
+            "total": len(lines),
+            "valid": valid,
+            "invalid": invalid,
+            "duplicate": duplicate,
+        }
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
+
+@flask_app.route("/debug_callback", methods=["POST"])
+def debug_callback():
+    """Debug endpoint to test Agent Reach confirm callback without Telegram."""
+    try:
+        session_id = request.json.get("session_id", "")
+        user_id = request.json.get("user_id", 1768510980)
+        chat_id = request.json.get("chat_id", 1768510980)
+        session = _load_agentreach_session(user_id, session_id)
+        if not session:
+            return {"error": "Session not found"}, 404
+        candidates = session.get("candidates", [])
+        if not candidates:
+            return {"error": "No candidates"}, 400
+        result = add_multiple_items_transactional(user_id, chat_id, candidates, source="agentreach")
+        return result
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
+if __name__ == "__main__":
+    main()
