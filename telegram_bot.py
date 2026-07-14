@@ -2294,6 +2294,29 @@ def debug_agentreach():
         return {"error": str(exc), "trace": traceback.format_exc()}, 500
 
 
+@flask_app.route("/debug_callback", methods=["POST"])
+def debug_callback():
+    """Debug endpoint to test Agent Reach confirm callback without Telegram."""
+    try:
+        session_id = request.json.get("session_id", "")
+        user_id = request.json.get("user_id", 1768510980)
+        chat_id = request.json.get("chat_id", 1768510980)
+        
+        session = _load_agentreach_session(user_id, session_id)
+        if not session:
+            return {"error": "Session not found"}, 404
+        
+        candidates = session.get("candidates", [])
+        if not candidates:
+            return {"error": "No candidates"}, 400
+        
+        result = add_multiple_items_transactional(user_id, chat_id, candidates, source="agentreach")
+        return result
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
+
 @flask_app.route("/seed_trends", methods=["POST"])
 def seed_trends():
     """Seed test trends for Phase 1 verification. Protected by webhook secret."""
