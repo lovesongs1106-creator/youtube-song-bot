@@ -63,7 +63,15 @@ from feature_flags import (
     ENABLE_APPROVE_WORKFLOW,
 )
 
-from agents.simple_trend import generate_daily_report, trend_debug_info, collect_and_save_trends, get_real_trends
+from agents.viral_trend_engine import generate_daily_report, trend_debug_info, collect_and_save_trends, get_real_trends
+from agents.outro_manager import (
+    add_outro,
+    list_outros,
+    remove_outro,
+    select_outro,
+    record_outro_usage,
+    format_outro_list,
+)
 
 WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO, WAITING_RETRY_AUDIO = range(6)
 
@@ -301,9 +309,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Default privacy: {DEFAULT_PRIVACY}\n\n"
         "Commands:\n"
         "/auth - YouTube channel connect karo\n"
-        "/export_youtube_token - GitHub Actions secret ke liye token export karo\n"
-        "/github_test - GitHub repo/token connection check karo\n"
         "/new - Naya video banao aur upload karo\n"
+        "/daily_report - Viral trends dekho\n"
+        "/trend_debug - Trend engine diagnostics\n"
+        "/outro_add - Outro video add karo\n"
+        "/outro_list - Sab outro videos dekho\n"
+        "/outro_remove <id> - Outro hatao\n"
+        "/outro_test - Selection test karo\n"
+        "/github_test - GitHub connection check\n"
+        "/export_youtube_token - Token export karo\n"
         "/id - Apna Telegram user ID dekho\n"
         "/cancel - Current process cancel"
     )
@@ -314,6 +328,108 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Your Telegram user ID: {update.effective_user.id}")
 
 
+# ==================== OUTRO MANAGEMENT COMMANDS ====================
+
+async def outro_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    file_id = None
+    ext = ".mp4"
+    name = "outro"
+
+    if update.message.video:
+        file_id = update.message.video.file_id
+        ext = ".mp4"
+        name = update.message.video.file_name or "outro_video"
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        name = update.message.document.file_name or "outro"
+        ext = Path(name).suffix or ".mp4"
+        mime = update.message.document.mime_type or ""
+        if not (ext in {".mp4", ".mov", ".mkv", ".webm"} or mime.startswith("video/")):
+            await update.message.reply_text("Please send a video file (MP4/MOV/MKV/WEBM).")
+            return
+    else:
+        await update.message.reply_text(
+            "Send an outro video as a Telegram video or document.\n"
+            "Optional: reply with /outro_add <name> <weight> to set metadata."
+        )
+        return
+
+    # Parse optional name/weight from caption or command args
+    weight = 10
+    custom_name = None
+    if context.args:
+        custom_name = context.args[0]
+        if len(context.args) > 1:
+            try:
+                weight = int(context.args[1])
+            except ValueError:
+                pass
+
+    outro_name = custom_name or Path(name).stem or "outro"
+    outro_id = add_outro(outro_name, file_id, ext, weight)
+    await update.message.reply_text(
+        f"✅ Outro added!\n\n"
+        f"ID: {outro_id}\n"
+        f"Name: {outro_name}\n"
+        f"Weight: {weight}\n"
+        f"Ext: {ext}\n\n"
+        f"Total active outros: {len(list_outros())}"
+    )
+
+
+async def outro_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    await update.message.reply_text(format_outro_list())
+
+
+async def outro_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /outro_remove <id>\n\nUse /outro_list to see IDs.")
+        return
+    try:
+        outro_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID must be a number.")
+        return
+
+    if remove_outro(outro_id):
+        await update.message.reply_text(f"✅ Outro {outro_id} removed.")
+    else:
+        await update.message.reply_text(f"❌ Outro {outro_id} not found.")
+
+
+async def outro_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    selected = select_outro()
+    if not selected:
+        await update.message.reply_text(
+            "📭 No active outros available.\n\nUse /outro_add to upload outro videos first."
+        )
+        return
+
+    await update.message.reply_text(
+        f"🎲 Outro Selection Test\n\n"
+        f"Selected: {selected['name']}\n"
+        f"ID: {selected['outro_id']}\n"
+        f"Ext: {selected['ext']}\n\n"
+        f"This outro would be used for the next upload."
+    )
 
 
 async def github_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -392,22 +508,31 @@ def home():
 
 @flask_app.route("/diag")
 def diag():
-    """Production diagnostic endpoint. Returns trend engine status."""
-    from agents.simple_trend import _yt_dlp_version, get_real_trends, DB_PATH
+    """Production diagnostic endpoint. Returns trend engine and outro status."""
+    from agents.viral_trend_engine import _yt_dlp_version, get_viral_trends, DB_PATH
+    from agents.outro_manager import list_outros, get_last_used_outro_ids
     from pathlib import Path
     db_exists = Path(DB_PATH).exists()
-    trends = get_real_trends(5)
+    trends = get_viral_trends(5)
+    outros = list_outros()
+    last_used = get_last_used_outro_ids(3)
     return {
         "status": "ok",
-        "commit": "440ff7f",
+        "commit": "9ad3c05",
         "yt_dlp_version": _yt_dlp_version(),
         "db_path": DB_PATH,
         "db_exists": db_exists,
         "db_trend_count": len(trends),
         "trends": [
-            {"song": t[0], "artist": t[1], "url": t[2], "score": t[3]}
+            {"song": t[0], "artist": t[1], "platform": t[2], "url": t[3],
+             "viral": t[4], "growth": t[5], "competition": t[6], "opportunity": t[7]}
             for t in trends
         ],
+        "outros": {
+            "count": len(outros),
+            "last_used_ids": last_used,
+            "items": [{"id": o.id, "name": o.name, "weight": o.weight} for o in outros],
+        },
         "feature_flags": {
             "ENABLE_TREND_AGENT": ENABLE_TREND_AGENT,
             "ENABLE_RECOMMENDATIONS": ENABLE_RECOMMENDATIONS,
@@ -539,6 +664,14 @@ async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_
     """If all required inputs are present, dispatch GitHub worker."""
     data = context.user_data
     has_source = data.get("source_type") == "youtube_url" or bool(data.get("audio_file_id"))
+
+    # Auto-select outro if not provided
+    if not data.get("outro_file_id"):
+        outro = select_outro()
+        if outro:
+            data["outro_file_id"] = outro["file_id"]
+            data["outro_ext"] = outro["ext"]
+
     if not (data.get("song_name") and has_source and data.get("outro_file_id")):
         missing = []
         if not data.get("song_name"):
@@ -546,7 +679,7 @@ async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_
         if not has_source:
             missing.append("audio file ya YouTube link")
         if not data.get("outro_file_id"):
-            missing.append("outro video")
+            missing.append("outro video (use /outro_add first)")
         await update.message.reply_text("Abhi missing hai: " + ", ".join(missing))
         return False
 
@@ -1068,9 +1201,23 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
     song_name, artist, youtube_url, _score = trends[0]
     metadata = generate_seo_metadata(song_name, artist, youtube_url)
 
+    # Auto-select outro from rotation system
+    outro = select_outro()
+    if not outro:
+        try:
+            await query.edit_message_text(
+                "❌ No outro videos available.\n"
+                "Use /outro_add to upload at least one outro video first."
+            )
+        except Exception as e:
+            if "Message is not modified" not in str(e):
+                raise
+        return
+
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    job_id = f"trend-{stamp}"
     payload = {
-        "job_id": f"trend-{stamp}",
+        "job_id": job_id,
         "chat_id": update.effective_chat.id,
         "user_id": update.effective_user.id,
         "song_name": song_name,
@@ -1081,9 +1228,12 @@ async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
         "custom_title": metadata["title"],
         "custom_description": metadata["description"],
         "custom_tags": metadata["tags"],
+        "outro_file_id": outro["file_id"],
+        "outro_ext": outro["ext"],
     }
 
     await asyncio.to_thread(dispatch_github_worker, payload)
+    record_outro_usage(outro["outro_id"], job_id)
 
     try:
         await query.edit_message_text(
@@ -1129,6 +1279,10 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("github_test", github_test))
     app.add_handler(CommandHandler("audio_retry", audio_retry))
     app.add_handler(CommandHandler("trend_debug", trend_debug))
+    app.add_handler(CommandHandler("outro_add", outro_add))
+    app.add_handler(CommandHandler("outro_list", outro_list))
+    app.add_handler(CommandHandler("outro_remove", outro_remove))
+    app.add_handler(CommandHandler("outro_test", outro_test))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
