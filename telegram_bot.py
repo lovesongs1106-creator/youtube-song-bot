@@ -87,7 +87,7 @@ from agents.queue_engine import (
     run_queue_processor,
     add_queue_item,
 )
-from agents.db import init_all_tables, is_already_uploaded
+from agents.db import init_all_tables, is_already_uploaded, fetchone
 
 WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO, WAITING_RETRY_AUDIO, WAITING_OUTRO_VIDEO, WAITING_OUTRO_NAME, WAITING_OUTRO_WEIGHT, WAITING_AGENTREACH = range(10)
 
