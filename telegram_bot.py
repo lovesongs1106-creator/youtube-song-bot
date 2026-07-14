@@ -1922,3 +1922,40 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@flask_app.route("/verify")
+def verify():
+    """Production verification endpoint. Returns raw DB rows."""
+    import sqlite3
+    from pathlib import Path
+    from agents.db import fetchall
+    
+    db_path = Path("storage/trends.db")
+    if not db_path.exists():
+        return {"error": "DB not found"}
+    
+    result = {}
+    
+    # uploads table
+    result["uploads"] = fetchall("SELECT id, song_name, youtube_url, youtube_video_id, source, uploaded_at FROM uploads ORDER BY id DESC LIMIT 10")
+    
+    # upload_queue
+    result["queue"] = fetchall("SELECT id, song_name, youtube_url, status, source, created_at FROM upload_queue ORDER BY id DESC LIMIT 10")
+    
+    # outros
+    result["outros"] = fetchall("SELECT id, name, file_id, file_unique_id, ext, weight, is_active, added_at FROM outros ORDER BY id")
+    
+    # outro_history
+    result["outro_history"] = fetchall("SELECT id, outro_id, upload_id, used_at FROM outro_history ORDER BY used_at DESC LIMIT 10")
+    
+    # trends
+    result["trends"] = fetchall("SELECT id, song_name, artist, youtube_url, source_platform, opportunity_score FROM trends ORDER BY opportunity_score DESC LIMIT 10")
+    
+    # queue_history
+    result["queue_history"] = fetchall("SELECT id, queue_id, action, detail, created_at FROM queue_history ORDER BY id DESC LIMIT 10")
+    
+    # system_state
+    result["system_state"] = fetchall("SELECT key, value FROM system_state")
+    
+    return result
