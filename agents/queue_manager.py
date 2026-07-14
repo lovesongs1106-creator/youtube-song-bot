@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manual Upload Queue System — SQLite-backed sequential job processor.
+"""Manual Upload Queue System — Database-backed sequential job processor.
 
 Tables:
   upload_queue    — pending/processing/completed/failed/cancelled jobs
@@ -15,80 +15,35 @@ Background processor:
 
 from __future__ import annotations
 
-import sqlite3
-from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-DB_PATH = "storage/trends.db"
+from agents.db import execute, fetchone, fetchall, insert_and_get_id, init_all_tables
 
 
 # ── Database ─────────────────────────────────────────────────────────────────
 
 def init_queue_tables() -> None:
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS upload_queue (
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER,
-            chat_id INTEGER,
-            song_name TEXT,
-            youtube_url TEXT,
-            status TEXT DEFAULT 'pending',
-            video_id TEXT,
-            error_message TEXT,
-            created_at TEXT,
-            completed_at TEXT
-        )"""
-    )
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS queue_history (
-            id INTEGER PRIMARY KEY,
-            queue_id INTEGER,
-            action TEXT,
-            detail TEXT,
-            created_at TEXT
-        )"""
-    )
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS queue_state (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )"""
-    )
-    conn.commit()
-    conn.close()
+    """Initialize queue tables via central db abstraction."""
+    init_all_tables()
 
 
 def _log_action(queue_id: int | None, action: str, detail: str = "") -> None:
-    init_queue_tables()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
+    execute(
         "INSERT INTO queue_history (queue_id, action, detail, created_at) VALUES (?, ?, ?, ?)",
         (queue_id, action, detail, datetime.now().isoformat()),
     )
-    conn.commit()
-    conn.close()
 
 
 # ── Queue CRUD ───────────────────────────────────────────────────────────────
 
 def add_queue_item(user_id: int, chat_id: int, song_name: str, youtube_url: str) -> int:
     init_queue_tables()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
+    item_id = insert_and_get_id(
         """INSERT INTO upload_queue (user_id, chat_id, song_name, youtube_url, status, created_at)
            VALUES (?, ?, ?, ?, 'pending', ?)""",
         (user_id, chat_id, song_name, youtube_url, datetime.now().isoformat()),
     )
-    item_id = c.lastrowid
-    conn.commit()
-    conn.close()
     _log_action(item_id, "added", f"song={song_name}")
     return item_id
 
@@ -103,78 +58,56 @@ def add_multiple_items(user_id: int, chat_id: int, items: list[dict[str, str]]) 
 
 def get_queue(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     init_queue_tables()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
     if status:
-        c.execute(
+        return fetchall(
             """SELECT * FROM upload_queue WHERE status = ? ORDER BY id LIMIT ?""",
             (status, limit),
         )
-    else:
-        c.execute("""SELECT * FROM upload_queue ORDER BY id DESC LIMIT ?""", (limit,))
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    return fetchall(
+        """SELECT * FROM upload_queue ORDER BY id DESC LIMIT ?""",
+        (limit,)
+    )
 
 
 def get_next_pending() -> dict[str, Any] | None:
     """Get oldest pending item."""
     init_queue_tables()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute(
+    return fetchone(
         """SELECT * FROM upload_queue WHERE status = 'pending' ORDER BY id LIMIT 1"""
     )
-    row = c.fetchone()
-    conn.close()
-    return dict(row) if row else None
 
 
 def update_status(item_id: int, status: str, video_id: str | None = None, error: str | None = None) -> None:
     init_queue_tables()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
     completed_at = datetime.now().isoformat() if status in ("completed", "failed", "cancelled") else None
-    c.execute(
+    execute(
         """UPDATE upload_queue
            SET status = ?, video_id = ?, error_message = ?, completed_at = ?
            WHERE id = ?""",
         (status, video_id, error, completed_at, item_id),
     )
-    conn.commit()
-    conn.close()
     _log_action(item_id, f"status_{status}", error or "")
 
 
 def cancel_all_pending() -> int:
     """Cancel all pending items. Returns count cancelled."""
     init_queue_tables()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""SELECT id FROM upload_queue WHERE status = 'pending'""")
-    ids = [r[0] for r in c.fetchall()]
+    items = fetchall("""SELECT id FROM upload_queue WHERE status = 'pending'""")
     now = datetime.now().isoformat()
-    c.execute(
+    execute(
         """UPDATE upload_queue SET status = 'cancelled', completed_at = ? WHERE status = 'pending'""",
         (now,),
     )
-    conn.commit()
-    conn.close()
-    for item_id in ids:
-        _log_action(item_id, "cancelled", "bulk_cancel")
-    return len(ids)
+    for item in items:
+        _log_action(item["id"], "cancelled", "bulk_cancel")
+    return len(items)
 
 
 def get_summary() -> dict[str, int]:
     """Return counts by status."""
     init_queue_tables()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""SELECT status, COUNT(*) FROM upload_queue GROUP BY status""")
-    counts = {r[0]: r[1] for r in c.fetchall()}
-    conn.close()
+    rows = fetchall("""SELECT status, COUNT(*) as cnt FROM upload_queue GROUP BY status""")
+    counts = {r["status"]: r["cnt"] for r in rows}
     return {
         "total": sum(counts.values()),
         "pending": counts.get("pending", 0),
@@ -189,25 +122,17 @@ def get_summary() -> dict[str, int]:
 
 def is_paused() -> bool:
     init_queue_tables()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT value FROM queue_state WHERE key = 'paused'")
-    row = c.fetchone()
-    conn.close()
-    return row is not None and row[0] == "true"
+    result = fetchone("SELECT value FROM system_state WHERE key = 'paused'")
+    return result is not None and result.get("value") == "true"
 
 
 def set_paused(paused: bool) -> None:
     init_queue_tables()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """INSERT INTO queue_state (key, value) VALUES ('paused', ?)
+    execute(
+        """INSERT INTO system_state (key, value) VALUES ('paused', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
         ("true" if paused else "false",),
     )
-    conn.commit()
-    conn.close()
     _log_action(None, "paused" if paused else "resumed", "")
 
 

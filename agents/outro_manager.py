@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from agents.db import execute, fetchone, fetchall
+from agents.db import execute, fetchone, fetchall, insert_and_get_id, get_changes
 
 
 # ── Data Model ───────────────────────────────────────────────────────────────
@@ -39,25 +39,18 @@ class Outro:
 
 def add_outro(name: str, file_id: str, ext: str = ".mp4", weight: int = 10, file_unique_id: str | None = None) -> int:
     """Add a new outro. Returns the outro ID."""
-    from agents.db import get_connection
-    conn = get_connection()
-    try:
-        c = conn.cursor()
-        c.execute(
-            """INSERT INTO outros (name, file_id, file_unique_id, ext, weight, is_active, added_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(file_id) DO UPDATE SET
-                   name=excluded.name,
-                   file_unique_id=excluded.file_unique_id,
-                   ext=excluded.ext,
-                   weight=excluded.weight,
-                   is_active=1""",
-            (name, file_id, file_unique_id, ext, weight, 1, datetime.now().isoformat()),
-        )
-        conn.commit()
-        return c.lastrowid or 0
-    finally:
-        conn.close()
+    outro_id = insert_and_get_id(
+        """INSERT INTO outros (name, file_id, file_unique_id, ext, weight, is_active, added_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(file_id) DO UPDATE SET
+               name=excluded.name,
+               file_unique_id=excluded.file_unique_id,
+               ext=excluded.ext,
+               weight=excluded.weight,
+               is_active=1""",
+        (name, file_id, file_unique_id, ext, weight, 1, datetime.now().isoformat()),
+    )
+    return outro_id or 0
 
 
 def list_outros() -> list[Outro]:
@@ -71,10 +64,15 @@ def list_outros() -> list[Outro]:
 
 def remove_outro(outro_id: int) -> bool:
     """Soft-delete an outro."""
-    execute("UPDATE outros SET is_active = 0 WHERE id = ?", (outro_id,))
-    # Check if any row was updated
-    result = fetchone("SELECT changes() as cnt")
-    return result is not None and result.get("cnt", 0) > 0
+    from agents.db import get_connection
+    conn = get_connection()
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE outros SET is_active = 0 WHERE id = ?", (outro_id,))
+        conn.commit()
+        return get_changes(c) > 0
+    finally:
+        conn.close()
 
 
 def get_outro_by_id(outro_id: int) -> Outro | None:

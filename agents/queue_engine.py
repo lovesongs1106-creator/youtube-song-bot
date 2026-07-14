@@ -15,7 +15,7 @@ import asyncio
 from datetime import datetime
 from typing import Any
 
-from agents.db import execute, fetchone, fetchall, is_already_uploaded, record_upload
+from agents.db import execute, fetchone, fetchall, is_already_uploaded, record_upload, insert_and_get_id
 
 
 # ── Queue CRUD ───────────────────────────────────────────────────────────────
@@ -26,22 +26,14 @@ def add_queue_item(user_id: int, chat_id: int, song_name: str, youtube_url: str,
     if is_already_uploaded(youtube_url):
         return None
 
-    # Use direct connection to get last_insert_rowid
-    from agents.db import get_connection
-    conn = get_connection()
-    try:
-        c = conn.cursor()
-        c.execute(
-            """INSERT INTO upload_queue (user_id, chat_id, song_name, youtube_url, status, source, created_at)
-               VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
-            (user_id, chat_id, song_name, youtube_url, source, datetime.now().isoformat()),
-        )
-        conn.commit()
-        item_id = c.lastrowid
+    item_id = insert_and_get_id(
+        """INSERT INTO upload_queue (user_id, chat_id, song_name, youtube_url, status, source, created_at)
+           VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+        (user_id, chat_id, song_name, youtube_url, source, datetime.now().isoformat()),
+    )
+    if item_id:
         _log_action(item_id, "added", f"source={source}, song={song_name}")
-        return item_id
-    finally:
-        conn.close()
+    return item_id
 
 
 def add_multiple_items(user_id: int, chat_id: int, items: list[dict[str, str]], source: str = "manual") -> tuple[list[int], list[dict]]:
@@ -97,7 +89,7 @@ def add_multiple_items_transactional(user_id: int, chat_id: int, items: list[dic
             "error": str | None,
         }
     """
-    from agents.db import get_connection
+    from agents.db import get_connection, USE_POSTGRES
     
     result = {
         "success": False,
@@ -136,16 +128,25 @@ def add_multiple_items_transactional(user_id: int, chat_id: int, items: list[dic
             seen_urls.add(url)
             
             # Check uploads table
-            c.execute("SELECT 1 FROM uploads WHERE youtube_url = ? LIMIT 1", (url,))
+            if USE_POSTGRES:
+                c.execute("SELECT 1 FROM uploads WHERE youtube_url = %s LIMIT 1", (url,))
+            else:
+                c.execute("SELECT 1 FROM uploads WHERE youtube_url = ? LIMIT 1", (url,))
             if c.fetchone():
                 result["rejected"].append({**item, "reason": "already_uploaded"})
                 continue
             
             # Check queue
-            c.execute(
-                "SELECT id FROM upload_queue WHERE youtube_url = ? AND status IN ('pending', 'processing') LIMIT 1",
-                (url,)
-            )
+            if USE_POSTGRES:
+                c.execute(
+                    "SELECT id FROM upload_queue WHERE youtube_url = %s AND status IN ('pending', 'processing') LIMIT 1",
+                    (url,)
+                )
+            else:
+                c.execute(
+                    "SELECT id FROM upload_queue WHERE youtube_url = ? AND status IN ('pending', 'processing') LIMIT 1",
+                    (url,)
+                )
             if c.fetchone():
                 result["rejected"].append({**item, "reason": "in_queue"})
                 continue
@@ -164,13 +165,25 @@ def add_multiple_items_transactional(user_id: int, chat_id: int, items: list[dic
             url = item["youtube_url"].strip()
             name = item["song_name"].strip()
             
-            c.execute(
-                """INSERT INTO upload_queue (user_id, chat_id, song_name, youtube_url, status, source, created_at)
-                   VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
-                (user_id, chat_id, name, url, source, now),
-            )
-            item_id = c.lastrowid
-            added_ids.append(item_id)
+            if USE_POSTGRES:
+                c.execute(
+                    """INSERT INTO upload_queue (user_id, chat_id, song_name, youtube_url, status, source, created_at)
+                       VALUES (%s, %s, %s, %s, 'pending', %s, %s)
+                       RETURNING id""",
+                    (user_id, chat_id, name, url, source, now),
+                )
+                row = c.fetchone()
+                item_id = row[0] if row else None
+            else:
+                c.execute(
+                    """INSERT INTO upload_queue (user_id, chat_id, song_name, youtube_url, status, source, created_at)
+                       VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                    (user_id, chat_id, name, url, source, now),
+                )
+                item_id = c.lastrowid
+            
+            if item_id:
+                added_ids.append(item_id)
         
         conn.commit()
         
@@ -183,7 +196,10 @@ def add_multiple_items_transactional(user_id: int, chat_id: int, items: list[dic
         result["added_count"] = len(added_ids)
         
         # Get updated pending count
-        c.execute("SELECT COUNT(*) as cnt FROM upload_queue WHERE status = 'pending'")
+        if USE_POSTGRES:
+            c.execute("SELECT COUNT(*) as cnt FROM upload_queue WHERE status = 'pending'")
+        else:
+            c.execute("SELECT COUNT(*) as cnt FROM upload_queue WHERE status = 'pending'")
         row = c.fetchone()
         result["pending_total"] = row[0] if row else 0
         

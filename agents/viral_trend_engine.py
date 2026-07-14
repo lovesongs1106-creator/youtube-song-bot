@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import random
 import re
-import sqlite3
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
@@ -28,6 +27,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from agents.db import execute, fetchall, init_all_tables
+
+# Backward-compat DB_PATH reference for diagnostics
 DB_PATH = "storage/trends.db"
 
 # ── Data Model ───────────────────────────────────────────────────────────────
@@ -92,48 +94,16 @@ def calculate_opportunity(viral: float, growth: float, competition: float) -> fl
 # ── Database ─────────────────────────────────────────────────────────────────
 
 def init_db() -> None:
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS viral_trends (
-            id INTEGER PRIMARY KEY,
-            song_name TEXT,
-            artist TEXT,
-            platform TEXT,
-            source_url TEXT,
-            viral_score REAL,
-            growth_rate REAL,
-            competition_score REAL,
-            opportunity_score REAL,
-            discovered_at TEXT,
-            last_updated TEXT
-        )"""
-    )
-    # Keep old trends table for backward compatibility
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS trends (
-            id INTEGER PRIMARY KEY,
-            song_name TEXT,
-            artist TEXT,
-            youtube_url TEXT,
-            trend_score REAL,
-            opportunity_score REAL,
-            collected_at TEXT
-        )"""
-    )
-    conn.commit()
-    conn.close()
+    """Initialize viral_trends table via central db abstraction."""
+    init_all_tables()
 
 
 def save_viral_trends(trends: list[ViralSong]) -> None:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM viral_trends")
+    execute("DELETE FROM viral_trends")
     now = datetime.now().isoformat()
     for t in trends:
-        c.execute(
+        execute(
             """INSERT INTO viral_trends
                (song_name, artist, platform, source_url, viral_score, growth_rate,
                 competition_score, opportunity_score, discovered_at, last_updated)
@@ -144,25 +114,25 @@ def save_viral_trends(trends: list[ViralSong]) -> None:
                 t.opportunity_score, t.discovered_at, now,
             ),
         )
-    conn.commit()
-    conn.close()
 
 
 def get_viral_trends(limit: int = 10) -> list[tuple]:
     init_db()
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
+        rows = fetchall(
             """SELECT song_name, artist, platform, source_url,
                       viral_score, growth_rate, competition_score, opportunity_score
                FROM viral_trends
                ORDER BY opportunity_score DESC LIMIT ?""",
-            (limit,),
+            (limit,)
         )
-        results = c.fetchall()
-        conn.close()
-        return results
+        return [
+            (
+                r["song_name"], r["artist"], r["platform"], r["source_url"],
+                r["viral_score"], r["growth_rate"], r["competition_score"], r["opportunity_score"]
+            )
+            for r in rows
+        ]
     except Exception as e:
         print(f"[VIRAL] DB read error: {e}")
         return []
