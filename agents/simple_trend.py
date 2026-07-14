@@ -17,6 +17,8 @@ BAD_KEYWORDS = [
     "back to back", "24/7", "radio", "hour loop", "mega mix",
     "full album", "greatest hits", "all songs", "bollywood hits",
     "weekend mix", "lofi mix", "study mix", "workout mix",
+    "trending songs", "latest songs", "new songs", "love songs",
+    "romantic songs", "hits songs", "superhit songs",
 ]
 
 
@@ -212,6 +214,7 @@ def collect_real_trends():
 
 def collect_and_save_trends():
     """Collect trends and atomically replace DB contents."""
+    init_db()  # Ensure table exists before any DB operations
     trends, logs = collect_real_trends()
     if not trends:
         return False, f"No trends found.\n\n{logs}"
