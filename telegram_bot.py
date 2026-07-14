@@ -2421,11 +2421,6 @@ def main() -> None:
         telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-if __name__ == "__main__":
-    main()
-
-
-
 @flask_app.route("/db_status")
 def db_status():
     """Show current database backend and persistence status."""
@@ -2438,3 +2433,6 @@ def db_status():
         "sqlite_exists": Path(DB_PATH).exists(),
         "persistence_warning": "SQLite is ephemeral on Render. Set DATABASE_URL env var to use PostgreSQL (Supabase/etc) for persistent storage.",
     }
+
+if __name__ == "__main__":
+    main()
