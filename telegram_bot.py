@@ -518,7 +518,7 @@ def diag():
     last_used = get_last_used_outro_ids(3)
     return {
         "status": "ok",
-        "commit": "9ad3c05",
+        "commit": "3279c76",
         "yt_dlp_version": _yt_dlp_version(),
         "db_path": DB_PATH,
         "db_exists": db_exists,
