@@ -2232,15 +2232,9 @@ def build_telegram_app() -> Application:
 @flask_app.route("/verify")
 def verify():
     """Production verification endpoint. Returns raw DB rows."""
-    import sqlite3
-    from pathlib import Path
-    from agents.db import fetchall
+    from agents.db import fetchall, USE_POSTGRES
     
-    db_path = Path("storage/trends.db")
-    if not db_path.exists():
-        return {"error": "DB not found"}
-    
-    result = {}
+    result = {"backend": "postgresql" if USE_POSTGRES else "sqlite"}
     
     # uploads table
     result["uploads"] = fetchall("SELECT id, song_name, youtube_url, youtube_video_id, source, uploaded_at FROM uploads ORDER BY id DESC LIMIT 10")
