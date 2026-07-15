@@ -328,6 +328,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Commands:\n"
         "/auth - YouTube channel connect karo\n"
         "/new - Naya video banao aur upload karo\n"
+        "/import_trends - Trending songs import karo\n"
         "/bulk_upload - Multiple songs queue karo\n"
         "/queue_status - Upload queue dekho\n"
         "/queue_pause - Queue roko\n"
@@ -534,15 +535,24 @@ async def bulk_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def handle_bulk_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages when user is in bulk upload mode. Webhook-safe via DB."""
-    print("[BULK_UPLOAD_RECEIVED] text handler triggered", flush=True)
+    """Handle text messages when user is in bulk upload or import_trends mode. Webhook-safe via DB."""
     if not update.message or not update.message.text:
-        print("[BULK_UPLOAD_RECEIVED] no text", flush=True)
         return
 
     user_id = update.effective_user.id
-    # Check DB for awaiting flag (webhook-safe)
     from agents.db import fetchone, execute
+
+    # First check if user is in import_trends mode
+    import_awaiting = fetchone(
+        "SELECT value FROM system_state WHERE key = ?",
+        (f"import_trends_awaiting_{user_id}",)
+    )
+    if import_awaiting and import_awaiting.get("value") == "true":
+        await handle_import_trends_text(update, context)
+        return
+
+    # Then check if user is in bulk upload mode
+    print("[BULK_UPLOAD_RECEIVED] text handler triggered", flush=True)
     awaiting_row = fetchone(
         "SELECT value FROM system_state WHERE key = ?",
         (f"bulk_awaiting_{user_id}",)
@@ -632,6 +642,199 @@ async def bulk_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id
     _load_bulk_session(user_id, session_id)  # load + delete
     await query.edit_message_text("❌ Bulk upload cancelled.")
+
+
+# ==================== IMPORT TRENDS (PRIMARY WORKFLOW) ====================
+
+def _store_import_trends_session(user_id: int, trends: list) -> str:
+    """Store import trends session in DB for webhook-safe retrieval."""
+    import json, secrets
+    from agents.db import execute
+    session_id = secrets.token_urlsafe(16)
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"import_trends_{user_id}_{session_id}", json.dumps({
+            "trends": trends,
+            "created_at": dt.datetime.now().isoformat(),
+        }))
+    )
+    return session_id
+
+
+def _load_import_trends_session(user_id: int, session_id: str) -> dict | None:
+    import json
+    from agents.db import fetchone, execute
+    row = fetchone("SELECT value FROM system_state WHERE key = ?", (f"import_trends_{user_id}_{session_id}",))
+    if not row:
+        return None
+    execute("DELETE FROM system_state WHERE key = ?", (f"import_trends_{user_id}_{session_id}",))
+    return json.loads(row["value"])
+
+
+def _parse_import_trend_lines(lines: list[str]) -> tuple[list[dict], list[tuple]]:
+    """Parse trend import lines. Returns (valid_trends, invalid_items)."""
+    valid = []
+    invalid = []
+    seen_urls = set()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if "|" not in line:
+            invalid.append((line, "Missing | separator"))
+            continue
+        parts = [p.strip() for p in line.split("|", 1)]
+        song_name = parts[0]
+        url = extract_youtube_url(parts[1]) if len(parts) > 1 else None
+        if not song_name:
+            invalid.append((line, "Missing song name"))
+            continue
+        if not url:
+            invalid.append((line, "Invalid or missing YouTube URL"))
+            continue
+        if url in seen_urls:
+            invalid.append((line, "Duplicate URL in batch"))
+            continue
+        seen_urls.add(url)
+        valid.append({"song_name": song_name, "youtube_url": url})
+    return valid, invalid
+
+
+async def import_trends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start /import_trends — stores awaiting flag in DB."""
+    print("[IMPORT_TRENDS_START] command received", flush=True)
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    user_id = update.effective_user.id
+    from agents.db import execute
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"import_trends_awaiting_{user_id}", "true")
+    )
+    await update.message.reply_text(
+        "📥 Trend Import Mode\n\n"
+        "Paste trending songs in this format:\n\n"
+        "Song Name 1 | https://youtube.com/watch?v=abc\n"
+        "Song Name 2 | https://youtube.com/watch?v=def\n"
+        "Song Name 3 | https://youtube.com/watch?v=ghi\n\n"
+        "These will be saved as trends for /daily_report and Approve workflow."
+    )
+
+
+async def handle_import_trends_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text when user is in import_trends mode. Webhook-safe via DB."""
+    print("[IMPORT_TRENDS_RECEIVED] text handler triggered", flush=True)
+    if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_user.id
+    from agents.db import fetchone, execute
+    awaiting_row = fetchone(
+        "SELECT value FROM system_state WHERE key = ?",
+        (f"import_trends_awaiting_{user_id}",)
+    )
+    if not awaiting_row or awaiting_row.get("value") != "true":
+        print(f"[IMPORT_TRENDS_RECEIVED] user={user_id} not awaiting", flush=True)
+        return
+
+    text = update.message.text.strip()
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    valid, invalid = _parse_import_trend_lines(lines)
+    print(f"[IMPORT_TRENDS_PARSED] valid={len(valid)} invalid={len(invalid)}", flush=True)
+
+    # Clear awaiting flag
+    execute("DELETE FROM system_state WHERE key = ?", (f"import_trends_awaiting_{user_id}",))
+
+    if not valid:
+        await update.message.reply_text("❌ No valid trends found. Check format and try again.")
+        return
+
+    # Store session for confirm
+    session_id = _store_import_trends_session(user_id, valid)
+
+    summary = (
+        f"📊 Trend Import Summary\n\n"
+        f"Total lines: {len(lines)}\n"
+        f"✅ Valid: {len(valid)}\n"
+        f"❌ Invalid: {len(invalid)}\n\n"
+        f"Valid trends:\n"
+    )
+    for i, item in enumerate(valid[:10], 1):
+        summary += f"{i}. {item['song_name']}\n"
+    if len(valid) > 10:
+        summary += f"... and {len(valid) - 10} more\n"
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Save To Trends", callback_data=f"import_confirm_{session_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"import_cancel_{session_id}")],
+    ]
+    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def import_trends_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save imported trends to database."""
+    print("[IMPORT_TRENDS_SAVE] confirm callback", flush=True)
+    query = update.callback_query
+    await query.answer()
+
+    callback_data = query.data or ""
+    session_id = callback_data.replace("import_confirm_", "")
+    user_id = update.effective_user.id
+    session = _load_import_trends_session(user_id, session_id)
+    if not session:
+        await query.edit_message_text("❌ Session expired. Send /import_trends again.")
+        return
+
+    trends = session.get("trends", [])
+    if not trends:
+        await query.edit_message_text("❌ No valid trends to save.")
+        return
+
+    from agents.db import execute
+    now = dt.datetime.now().isoformat()
+    saved = 0
+    for trend in trends:
+        try:
+            execute(
+                """INSERT INTO trends (song_name, artist, youtube_url, source_platform, viral_score, growth_score, competition_score, opportunity_score, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    trend["song_name"],
+                    "",
+                    trend["youtube_url"],
+                    "agentreach",
+                    50.0,  # default viral_score
+                    50.0,  # default growth_score
+                    30.0,  # default competition_score
+                    60.0,  # default opportunity_score
+                    now,
+                )
+            )
+            saved += 1
+        except Exception as exc:
+            print(f"[IMPORT_TRENDS_SAVE] failed to save {trend['song_name']}: {exc}", flush=True)
+
+    print(f"[IMPORT_TRENDS_SAVE] saved={saved}", flush=True)
+    await query.edit_message_text(
+        f"✅ {saved} trends saved to database!\n\n"
+        f"Use /daily_report to view and approve them.\n"
+        f"Use /queue_status to check upload queue."
+    )
+
+
+async def import_trends_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel import trends."""
+    query = update.callback_query
+    await query.answer()
+    callback_data = query.data or ""
+    session_id = callback_data.replace("import_cancel_", "")
+    user_id = update.effective_user.id
+    _load_import_trends_session(user_id, session_id)
+    await query.edit_message_text("❌ Trend import cancelled.")
 
 
 async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2069,8 +2272,13 @@ async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     if not trends:
         report_text = (
-            "📈 No trends found.\n\n"
-            "Run /trend_debug to diagnose."
+            "📈 No imported trends available.\n\n"
+            "Use /import_trends to add trending songs from Agent Reach.\n"
+            "Or use /bulk_upload to queue songs directly for upload.\n\n"
+            "Example:\n"
+            "/import_trends\n"
+            "Song Name 1 | https://youtube.com/watch?v=abc\n"
+            "Song Name 2 | https://youtube.com/watch?v=def"
         )
         await update.message.reply_text(report_text)
         return
@@ -2227,6 +2435,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("queue_resume", queue_resume_cmd))
     app.add_handler(CommandHandler("queue_cancel", queue_cancel_cmd))
     app.add_handler(CommandHandler("bulk_upload", bulk_upload))
+    app.add_handler(CommandHandler("import_trends", import_trends))
 
     # Outro add conversation (polling mode)
     outro_conv = ConversationHandler(
@@ -2290,6 +2499,10 @@ def build_telegram_app() -> Application:
     if ENABLE_BULK_UPLOAD:
         app.add_handler(CallbackQueryHandler(bulk_confirm_callback, pattern=r"^bulk_confirm_"))
         app.add_handler(CallbackQueryHandler(bulk_cancel_callback, pattern=r"^bulk_cancel_"))
+
+    # Import trends callbacks (always enabled as primary workflow)
+    app.add_handler(CallbackQueryHandler(import_trends_confirm_callback, pattern=r"^import_confirm_"))
+    app.add_handler(CallbackQueryHandler(import_trends_cancel_callback, pattern=r"^import_cancel_"))
 
     if ENABLE_APPROVE_WORKFLOW:
         app.add_handler(CallbackQueryHandler(approve_song_callback, pattern=r"^approve_trend_\d+$"))
