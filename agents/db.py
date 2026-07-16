@@ -18,39 +18,43 @@ DB_PATH = "storage/trends.db"
 
 # Detect if PostgreSQL is available
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-USE_POSTGRES = DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres")
+_FORCE_SQLITE = False
 
+def is_using_postgres():
+    """Check if we are actually using PostgreSQL."""
+    return (DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres")) and not _FORCE_SQLITE
 
 def _adapt_sql(sql: str) -> str:
     """Translate SQLite SQL to PostgreSQL compatible syntax."""
-    if not USE_POSTGRES:
+    if not is_using_postgres():
         return sql
     # Replace ? placeholders with %s for psycopg2
-    # Simple regex: match ? that are not inside string literals
-    # Since our SQL never has ? inside literals, simple replace works
     sql = sql.replace("?", "%s")
-    # SQLite AUTOINCREMENT -> PostgreSQL SERIAL (handled in DDL, not here)
-    # SQLite INSERT OR IGNORE -> PostgreSQL ON CONFLICT DO NOTHING
     sql = sql.replace("INSERT OR IGNORE", "INSERT")
-    # SQLite ON CONFLICT(file_id) DO UPDATE SET ... (works in PG 9.5+)
-    # SQLite ON CONFLICT(key) DO UPDATE SET value=excluded.value (works in PG)
     return sql
-
 
 def get_connection():
     """Return database connection. PostgreSQL preferred, SQLite fallback."""
-    if USE_POSTGRES:
+    global _FORCE_SQLITE
+    if (DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres")) and not _FORCE_SQLITE:
         try:
             import psycopg2
-            return psycopg2.connect(DATABASE_URL)
+            # Add a 5 second timeout to avoid hanging startup
+            return psycopg2.connect(DATABASE_URL, connect_timeout=5)
         except ImportError:
             print("[DB] psycopg2 not installed, falling back to SQLite", flush=True)
+            _FORCE_SQLITE = True
         except Exception as e:
             print(f"[DB] PostgreSQL connection failed: {e}, falling back to SQLite", flush=True)
+            # If it's a Supabase IPv6 error, give a helpful hint
+            if "Network is unreachable" in str(e) or "could not translate host name" in str(e):
+                print("[DB] HINT: This looks like a Supabase IPv6-only issue on an IPv4-only host (like Render).", flush=True)
+                print("[DB] HINT: Use the Supabase IPv4 Pooler URL instead.", flush=True)
+            _FORCE_SQLITE = True
+            
     # SQLite fallback
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(DB_PATH)
-
 
 def execute(sql: str, params: tuple = ()) -> None:
     """Execute SQL with auto-commit."""
@@ -62,12 +66,11 @@ def execute(sql: str, params: tuple = ()) -> None:
     finally:
         conn.close()
 
-
 def fetchone(sql: str, params: tuple = ()) -> dict[str, Any] | None:
     """Fetch single row as dict."""
     conn = get_connection()
     try:
-        if USE_POSTGRES:
+        if is_using_postgres():
             import psycopg2.extras
             c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         else:
@@ -79,12 +82,11 @@ def fetchone(sql: str, params: tuple = ()) -> dict[str, Any] | None:
     finally:
         conn.close()
 
-
 def fetchall(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
     """Fetch all rows as list of dicts."""
     conn = get_connection()
     try:
-        if USE_POSTGRES:
+        if is_using_postgres():
             import psycopg2.extras
             c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         else:
@@ -95,7 +97,6 @@ def fetchall(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
     finally:
         conn.close()
 
-
 def insert_and_get_id(sql: str, params: tuple = ()) -> int | None:
     """Execute INSERT and return generated primary key.
     
@@ -104,7 +105,7 @@ def insert_and_get_id(sql: str, params: tuple = ()) -> int | None:
     conn = get_connection()
     try:
         c = conn.cursor()
-        if USE_POSTGRES:
+        if is_using_postgres():
             # Append RETURNING id if not already present
             if "RETURNING" not in sql.upper():
                 sql = sql.strip().rstrip(";") + " RETURNING id"
@@ -119,14 +120,13 @@ def insert_and_get_id(sql: str, params: tuple = ()) -> int | None:
     finally:
         conn.close()
 
-
 def get_changes(cursor) -> int:
     """Get number of rows affected by last operation.
     
     For SQLite, executes SELECT changes().
     For PostgreSQL, uses cursor.rowcount.
     """
-    if USE_POSTGRES:
+    if is_using_postgres():
         return cursor.rowcount
     cursor.execute("SELECT changes() as cnt")
     row = cursor.fetchone()
@@ -382,14 +382,14 @@ def init_all_tables() -> None:
             "auto_mode_config", "viral_trends", "github_jobs",
         ]
         for table in tables:
-            ddl = _pg_ddl(table) if USE_POSTGRES else _sqlite_ddl(table)
+            ddl = _pg_ddl(table) if is_using_postgres() else _sqlite_ddl(table)
             if ddl:
                 c.execute(ddl)
 
         conn.commit()
 
         # Insert default auto_mode_config if not exists
-        if USE_POSTGRES:
+        if is_using_postgres():
             c.execute(
                 """INSERT INTO auto_mode_config (id, enabled, uploads_per_day, start_time)
                    VALUES (1, 0, 3, '06:00')
@@ -424,7 +424,7 @@ def migrate_v2_phase1() -> None:
     conn = get_connection()
     try:
         c = conn.cursor()
-        if USE_POSTGRES:
+        if is_using_postgres():
             c.execute("""
                 SELECT table_name FROM information_schema.tables
                 WHERE table_schema = 'public' AND table_name = 'uploads'
@@ -437,6 +437,7 @@ def migrate_v2_phase1() -> None:
         print("[DB] Phase 1 migration complete: all tables initialized")
     finally:
         conn.close()
+
 
 
 def is_already_uploaded(youtube_url: str) -> bool:
