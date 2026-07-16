@@ -2832,18 +2832,79 @@ def main() -> None:
         telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-@flask_app.route("/db_status")
-def db_status():
-    """Show current database backend and persistence status."""
-    from agents.db import USE_POSTGRES, DATABASE_URL, DB_PATH
-    from pathlib import Path
-    return {
-        "backend": "postgresql" if USE_POSTGRES else "sqlite",
-        "database_url_set": bool(DATABASE_URL),
-        "sqlite_path": DB_PATH,
-        "sqlite_exists": Path(DB_PATH).exists(),
-        "persistence_warning": "SQLite is ephemeral on Render. Set DATABASE_URL env var to use PostgreSQL (Supabase/etc) for persistent storage.",
-    }
+@flask_app.route("/dashboard")
+def dashboard():
+    """HTML Dashboard for bot monitoring."""
+    if not ENABLE_DASHBOARD:
+        return "Dashboard is disabled via feature flags.", 403
+        
+    from agents.db import is_using_postgres, _FORCE_SQLITE
+    from agents.queue_engine import get_summary, get_queue
+    
+    summary = get_summary()
+    queue = get_queue(limit=10)
+    
+    # Simple HTML template
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>YouTube Song Bot Dashboard</title>
+        <style>
+            body {{ font-family: sans-serif; margin: 20px; background: #f4f4f9; }}
+            .card {{ background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+            h2 {{ color: #333; margin-top: 0; }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }}
+            .status-pending {{ color: orange; }}
+            .status-processing {{ color: blue; }}
+            .status-completed {{ color: green; }}
+            .status-failed {{ color: red; }}
+            .badge {{ padding: 4px 8px; border-radius: 4px; font-size: 0.8em; font-weight: bold; }}
+            .badge-pg {{ background: #336791; color: white; }}
+            .badge-sqlite {{ background: #003b57; color: white; }}
+            .badge-error {{ background: #dc3545; color: white; }}
+        </style>
+    </head>
+    <body>
+        <h1>YouTube Song Bot Dashboard</h1>
+        
+        <div class="card">
+            <h2>Database Status</h2>
+            <p>Backend: 
+                <span class="badge {'badge-pg' if is_using_postgres() else 'badge-sqlite'}">
+                    {'PostgreSQL' if is_using_postgres() else 'SQLite'}
+                </span>
+                {f' <span class="badge badge-error">Fallback Active</span>' if _FORCE_SQLITE else ''}
+            </p>
+        </div>
+        
+        <div class="card">
+            <h2>Queue Summary</h2>
+            <table>
+                <tr><th>Total</th><th>Pending</th><th>Processing</th><th>Completed</th><th>Failed</th></tr>
+                <tr>
+                    <td>{summary['total']}</td>
+                    <td>{summary['pending']}</td>
+                    <td>{summary['processing']}</td>
+                    <td>{summary['completed']}</td>
+                    <td>{summary['failed']}</td>
+                </tr>
+            </table>
+        </div>
+        
+        <div class="card">
+            <h2>Recent Jobs</h2>
+            <table>
+                <tr><th>ID</th><th>Song</th><th>Status</th><th>Created At</th></tr>
+                {"".join([f"<tr><td>{j['id']}</td><td>{j['song_name']}</td><td class='status-{j['status']}'>{j['status']}</td><td>{j['created_at']}</td></tr>" for j in queue])}
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
 
 if __name__ == "__main__":
     main()
