@@ -490,3 +490,60 @@ def get_real_trends(limit: int = 5) -> list[tuple]:
 def collect_and_save_trends() -> tuple[bool, str]:
     """Backward-compatible wrapper."""
     return refresh_trends()
+
+
+
+def calculate_agentreach_score(metrics: dict) -> dict:
+    """Phase 4: Agent Reach source scoring and analytics."""
+    # Base metrics from Agent Reach
+    views = metrics.get('views', 0)
+    likes = metrics.get('likes', 0)
+    comments = metrics.get('comments', 0)
+    days_old = metrics.get('days_old', 1)
+    
+    # Calculate Engagement Rate (ER)
+    er = (likes + comments) / views if views > 0 else 0
+    
+    # Viral Score (0-100) - heavily weighted by ER and recency
+    viral_score = min(100, (er * 1000) * (1 / max(1, days_old)))
+    
+    # Growth Score (0-100) - views velocity
+    velocity = views / max(1, days_old)
+    growth_score = min(100, velocity / 10000) # Assuming 1M views/day is 100
+    
+    # Opportunity Score - combination of virality and growth
+    opportunity_score = (viral_score * 0.6) + (growth_score * 0.4)
+    
+    return {
+        'viral_score': round(viral_score, 2),
+        'growth_score': round(growth_score, 2),
+        'opportunity_score': round(opportunity_score, 2),
+        'analytics': {
+            'engagement_rate': round(er, 4),
+            'views_velocity': round(velocity, 2)
+        }
+    }
+
+def get_trend_analytics() -> dict:
+    """Phase 4: Trend analytics across all sources."""
+    from agents.db import fetchall
+    trends = fetchall("SELECT * FROM trends ORDER BY opportunity_score DESC LIMIT 50")
+    if not trends:
+        return {'total': 0, 'avg_opportunity': 0}
+        
+    avg_opp = sum(t.get('opportunity_score', 0) for t in trends) / len(trends)
+    top_source = "Unknown"
+    sources = {}
+    for t in trends:
+        src = t.get('source_platform', 'Unknown')
+        sources[src] = sources.get(src, 0) + 1
+        
+    if sources:
+        top_source = max(sources.items(), key=lambda x: x[1])[0]
+        
+    return {
+        'total_analyzed': len(trends),
+        'avg_opportunity': round(avg_opp, 2),
+        'top_source': top_source,
+        'source_distribution': sources
+    }

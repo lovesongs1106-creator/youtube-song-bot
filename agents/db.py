@@ -20,6 +20,12 @@ DB_PATH = "storage/trends.db"
 # DEFAULT_URL is Sydney Pooler for ap-southeast-2
 DEFAULT_URL = "postgresql://postgres.vckbjanbeovtqszsmfte:buzZug-mattym-jymby5@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres"
 DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_URL).strip()
+
+# FIX: Automatically convert Supabase IPv6 URL to IPv4 Pooler URL
+if "db.vckbjanbeovtqszsmfte.supabase.co" in DATABASE_URL:
+    DATABASE_URL = DEFAULT_URL
+    print("[DB] Intercepted IPv6 URL. Using IPv4 Pooler instead.", flush=True)
+
 _FORCE_SQLITE = False
 
 def is_using_postgres():
