@@ -2485,6 +2485,65 @@ def run_flask() -> None:
     flask_app.run(host="0.0.0.0", port=port)
 
 
+
+async def trend_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Phase 4: Show trend analytics"""
+    if await reject_if_unauthorized(update):
+        return
+    from agents.viral_trend_engine import get_trend_analytics
+    stats = get_trend_analytics()
+    if stats['total_analyzed'] == 0:
+        await update.message.reply_text("📊 No trend data available.")
+        return
+        
+    msg = (
+        "📊 **Trend Analytics (Phase 4)**\n\n"
+        f"• Total Analyzed: {stats['total_analyzed']}\n"
+        f"• Avg Opportunity Score: {stats['avg_opportunity']}/100\n"
+        f"• Top Source: {stats['top_source']}\n\n"
+        "**Source Distribution:**\n"
+    )
+    for src, count in stats.get('source_distribution', {}).items():
+        msg += f"  - {src}: {count}\n"
+        
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+
+async def auto_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Phase 5: Toggle Auto Mode"""
+    if await reject_if_unauthorized(update):
+        return
+        
+    from agents.db import fetchone, execute
+    args = context.args
+    if not args:
+        config = fetchone("SELECT * FROM auto_mode_config WHERE id = 1")
+        if not config:
+            await update.message.reply_text("Auto Mode not configured.")
+            return
+        state = "ON" if config["enabled"] else "OFF"
+        await update.message.reply_text(
+            f"🤖 **Auto Mode Status:** {state}\n"
+            f"• Uploads per day: {config['uploads_per_day']}\n"
+            f"• Start time: {config['start_time']}\n"
+            f"• Last run: {config['last_run']}\n\n"
+            "Use `/auto_mode on` or `/auto_mode off` to toggle.",
+            parse_mode="Markdown"
+        )
+        return
+        
+    action = args[0].lower()
+    if action == "on":
+        execute("UPDATE auto_mode_config SET enabled = 1 WHERE id = 1")
+        await update.message.reply_text("✅ Auto Mode is now ON.")
+    elif action == "off":
+        execute("UPDATE auto_mode_config SET enabled = 0 WHERE id = 1")
+        await update.message.reply_text("⏸️ Auto Mode is now OFF.")
+    else:
+        await update.message.reply_text("Usage: `/auto_mode on|off`")
+
+
 def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -2499,6 +2558,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("outro_test", outro_test))
     app.add_handler(CommandHandler("queue_status", queue_status_cmd))
     app.add_handler(CommandHandler("queue_pause", queue_pause_cmd))
+    app.add_handler(CommandHandler("auto_mode", auto_mode_cmd))
     app.add_handler(CommandHandler("queue_resume", queue_resume_cmd))
     app.add_handler(CommandHandler("queue_cancel", queue_cancel_cmd))
     app.add_handler(CommandHandler("worker_status", worker_status))
@@ -2821,6 +2881,13 @@ def main() -> None:
                 loop,
             )
             print("[QUEUE] Background processor scheduled", flush=True)
+
+            asyncio.run_coroutine_threadsafe(
+                run_auto_mode_scheduler(telegram_app.bot),
+                loop,
+            )
+            print("[AUTO_MODE] Scheduler started", flush=True)
+    
             loop.run_forever()
 
         thread = threading.Thread(target=bot_loop_thread, daemon=True)
@@ -2839,6 +2906,29 @@ def toggle_queue():
     current = is_paused()
     set_paused(not current)
     return "OK", 200
+
+
+@flask_app.route("/system_health")
+def system_health():
+    if not ENABLE_SYSTEM_HEALTH:
+        return {"error": "System health disabled"}, 403
+    from agents.db import is_using_postgres, _FORCE_SQLITE, fetchall, get_connection
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT 1")
+        c.fetchone()
+        conn.close()
+        db_ok = True
+    except Exception as e:
+        db_ok = False
+        
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "backend": "postgresql" if is_using_postgres() else "sqlite",
+        "fallback_active": _FORCE_SQLITE,
+        "database_connected": db_ok
+    }
 
 @flask_app.route("/dashboard")
 def dashboard():
@@ -2875,10 +2965,10 @@ def dashboard():
         </style>
     
     <script>
-    function toggleQueue() {
-        fetch('/toggle_queue', {method: 'POST'})
+    function toggleQueue() {{
+        fetch('/toggle_queue', {{method: 'POST'}})
         .then(() => window.location.reload());
-    }
+    }}
     </script>
 </head>
     <body>
