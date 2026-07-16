@@ -2832,6 +2832,14 @@ def main() -> None:
         telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
+
+@flask_app.route("/toggle_queue", methods=["POST"])
+def toggle_queue():
+    from agents.queue_engine import is_paused, set_paused
+    current = is_paused()
+    set_paused(not current)
+    return "OK", 200
+
 @flask_app.route("/dashboard")
 def dashboard():
     """HTML Dashboard for bot monitoring."""
@@ -2839,7 +2847,7 @@ def dashboard():
         return "Dashboard is disabled via feature flags.", 403
         
     from agents.db import is_using_postgres, _FORCE_SQLITE
-    from agents.queue_engine import get_summary, get_queue
+    from agents.queue_engine import get_summary, get_queue, is_paused
     
     summary = get_summary()
     queue = get_queue(limit=10)
@@ -2865,7 +2873,14 @@ def dashboard():
             .badge-sqlite {{ background: #003b57; color: white; }}
             .badge-error {{ background: #dc3545; color: white; }}
         </style>
-    </head>
+    
+    <script>
+    function toggleQueue() {
+        fetch('/toggle_queue', {method: 'POST'})
+        .then(() => window.location.reload());
+    }
+    </script>
+</head>
     <body>
         <h1>YouTube Song Bot Dashboard</h1>
         
@@ -2880,7 +2895,7 @@ def dashboard():
         </div>
         
         <div class="card">
-            <h2>Queue Summary</h2>
+            <h2>Queue Summary</h2><p>Status: { 'Paused ⏸️' if is_paused() else 'Active ▶️' } <button onclick="toggleQueue()" style="padding: 5px 10px; cursor: pointer;">Toggle Queue</button></p>
             <table>
                 <tr><th>Total</th><th>Pending</th><th>Processing</th><th>Completed</th><th>Failed</th></tr>
                 <tr>
