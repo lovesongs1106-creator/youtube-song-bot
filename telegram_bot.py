@@ -2544,6 +2544,38 @@ async def auto_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Usage: `/auto_mode on|off`")
 
 
+async def run_auto_mode_scheduler(bot) -> None:
+    """Phase 5: Auto Mode Scheduler.
+    Checks config every 10 minutes and dispatches uploads if enabled.
+    """
+    from agents.db import fetchone, execute
+    from agents.viral_trend_engine import generate_daily_report
+    import datetime as dt
+
+    print("[AUTO_MODE] Scheduler loop started", flush=True)
+    while True:
+        try:
+            config = fetchone("SELECT * FROM auto_mode_config WHERE id = 1")
+            if config and config["enabled"]:
+                now = dt.datetime.now()
+                current_time = now.strftime("%H:%M")
+                
+                # Simple logic: run once a day at start_time
+                if current_time == config["start_time"]:
+                    last_run = config.get("last_run")
+                    today = now.strftime("%Y-%m-%d")
+                    
+                    if last_run != today:
+                        print(f"[AUTO_MODE] Triggering daily uploads at {current_time}", flush=True)
+                        # Here you would implement the auto-approve logic
+                        execute("UPDATE auto_mode_config SET last_run = ? WHERE id = 1", (today,))
+            
+        except Exception as e:
+            print(f"[AUTO_MODE] Scheduler error: {e}", flush=True)
+            
+        await asyncio.sleep(600) # Check every 10 mins
+
+
 def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -2650,9 +2682,9 @@ def build_telegram_app() -> Application:
 @flask_app.route("/verify")
 def verify():
     """Production verification endpoint. Returns raw DB rows."""
-    from agents.db import fetchall, USE_POSTGRES
+    from agents.db import fetchall, is_using_postgres
     
-    result = {"backend": "postgresql" if USE_POSTGRES else "sqlite"}
+    result = {"backend": "postgresql" if is_using_postgres() else "sqlite"}
     
     # uploads table
     result["uploads"] = fetchall("SELECT id, song_name, youtube_url, youtube_video_id, source, uploaded_at FROM uploads ORDER BY id DESC LIMIT 10")

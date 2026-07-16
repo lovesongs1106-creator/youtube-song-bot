@@ -32,6 +32,9 @@ def is_using_postgres():
     """Check if we are actually using PostgreSQL."""
     return (DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres")) and not _FORCE_SQLITE
 
+# For backward compatibility with existing code
+USE_POSTGRES = (DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres"))
+
 def _adapt_sql(sql: str) -> str:
     """Translate SQLite SQL to PostgreSQL compatible syntax."""
     if not is_using_postgres():
