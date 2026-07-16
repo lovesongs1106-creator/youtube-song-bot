@@ -27,14 +27,9 @@ if "db.vckbjanbeovtqszsmfte.supabase.co" in DATABASE_URL or "vckbjanbeovtqszsmft
     DATABASE_URL = "postgresql://postgres.vckbjanbeovtqszsmfte:buzZug-mattym-jymby5@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres"
     print("[DB] Forcing IPv4 Pooler URL.", flush=True)
 
-_FORCE_SQLITE = False
-
 def is_using_postgres():
     """Check if we are actually using PostgreSQL."""
     return (DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres")) and not _FORCE_SQLITE
-
-# For backward compatibility with existing code
-USE_POSTGRES = (DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres"))
 
 def _adapt_sql(sql: str) -> str:
     """Translate SQLite SQL to PostgreSQL compatible syntax."""

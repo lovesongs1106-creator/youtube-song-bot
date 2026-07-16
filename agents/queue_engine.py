@@ -89,7 +89,7 @@ def add_multiple_items_transactional(user_id: int, chat_id: int, items: list[dic
             "error": str | None,
         }
     """
-    from agents.db import get_connection, USE_POSTGRES
+    from agents.db import get_connection, is_using_postgres
     
     result = {
         "success": False,
@@ -128,7 +128,7 @@ def add_multiple_items_transactional(user_id: int, chat_id: int, items: list[dic
             seen_urls.add(url)
             
             # Check uploads table
-            if USE_POSTGRES:
+            if is_using_postgres():
                 c.execute("SELECT 1 FROM uploads WHERE youtube_url = %s LIMIT 1", (url,))
             else:
                 c.execute("SELECT 1 FROM uploads WHERE youtube_url = ? LIMIT 1", (url,))
@@ -137,7 +137,7 @@ def add_multiple_items_transactional(user_id: int, chat_id: int, items: list[dic
                 continue
             
             # Check queue
-            if USE_POSTGRES:
+            if is_using_postgres():
                 c.execute(
                     "SELECT id FROM upload_queue WHERE youtube_url = %s AND status IN ('pending', 'processing') LIMIT 1",
                     (url,)
@@ -165,7 +165,7 @@ def add_multiple_items_transactional(user_id: int, chat_id: int, items: list[dic
             url = item["youtube_url"].strip()
             name = item["song_name"].strip()
             
-            if USE_POSTGRES:
+            if is_using_postgres():
                 c.execute(
                     """INSERT INTO upload_queue (user_id, chat_id, song_name, youtube_url, status, source, created_at)
                        VALUES (%s, %s, %s, %s, 'pending', %s, %s)
@@ -196,7 +196,7 @@ def add_multiple_items_transactional(user_id: int, chat_id: int, items: list[dic
         result["added_count"] = len(added_ids)
         
         # Get updated pending count
-        if USE_POSTGRES:
+        if is_using_postgres():
             c.execute("SELECT COUNT(*) as cnt FROM upload_queue WHERE status = 'pending'")
         else:
             c.execute("SELECT COUNT(*) as cnt FROM upload_queue WHERE status = 'pending'")
