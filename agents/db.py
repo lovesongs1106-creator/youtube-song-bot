@@ -17,7 +17,9 @@ from typing import Any
 DB_PATH = "storage/trends.db"
 
 # Detect if PostgreSQL is available
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+# DEFAULT_URL is Sydney Pooler for ap-southeast-2
+DEFAULT_URL = "postgresql://postgres.vckbjanbeovtqszsmfte:buzZug-mattym-jymby5@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres"
+DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_URL).strip()
 _FORCE_SQLITE = False
 
 def is_using_postgres():
