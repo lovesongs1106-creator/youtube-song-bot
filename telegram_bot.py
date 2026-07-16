@@ -315,6 +315,23 @@ def dispatch_github_worker(payload: dict[str, Any]) -> None:
                 "GITHUB_TOKEN=PAT with repo access"
             )
         raise RuntimeError(f"GitHub dispatch failed: {r.status_code} {r.text[:1000]}")
+    # Track job in database for /worker_status
+    job_id = payload.get("job_id", "unknown")
+    song_name = payload.get("song_name", "Unknown")
+    now = dt.datetime.now().isoformat()
+    try:
+        from agents.db import execute
+        execute(
+            """INSERT INTO github_jobs (job_id, song_name, status, stage, dispatched_at, updated_at)
+               VALUES (?, ?, 'dispatched', 'queued', ?, ?)
+               ON CONFLICT(job_id) DO UPDATE SET
+                   status=excluded.status,
+                   stage=excluded.stage,
+                   updated_at=excluded.updated_at""",
+            (job_id, song_name, now, now)
+        )
+    except Exception as e:
+        print(f"[WORKER] Failed to track job dispatch: {e}", flush=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
@@ -334,6 +351,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/queue_pause - Queue roko\n"
         "/queue_resume - Queue chalao\n"
         "/queue_cancel - Pending items cancel karo\n"
+        "/worker_status - GitHub worker status dekho\n"
         "/daily_report - Viral trends dekho\n"
         "/trend_debug - Trend engine diagnostics\n"
         "/outro_add - Outro video add karo\n"
@@ -1503,6 +1521,55 @@ async def queue_cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(f"🚫 Cancelled {count} pending item(s) from the queue.")
 
 
+async def worker_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show status of recent GitHub worker jobs."""
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    from agents.db import fetchall
+    jobs = fetchall(
+        """SELECT job_id, song_name, status, stage, error_message, dispatched_at, updated_at
+           FROM github_jobs ORDER BY dispatched_at DESC LIMIT 10"""
+    )
+
+    if not jobs:
+        await update.message.reply_text(
+            "🚀 GitHub Worker Status\n\n"
+            "No jobs tracked yet.\n\n"
+            "Jobs will appear here after you approve a trend or bulk upload."
+        )
+        return
+
+    lines = ["🚀 GitHub Worker Status (Last 10 Jobs)\n"]
+    status_icons = {
+        "dispatched": "📤",
+        "downloading": "⬇️",
+        "rendering": "🎬",
+        "uploading": "📤",
+        "completed": "✅",
+        "failed": "❌",
+    }
+
+    for job in jobs:
+        icon = status_icons.get(job["status"], "❓")
+        song = job["song_name"][:30]
+        status = job["status"]
+        stage = job["stage"]
+        error = job["error_message"]
+        dispatched = job["dispatched_at"][:16] if job["dispatched_at"] else "?"
+
+        lines.append(f"{icon} {song}")
+        lines.append(f"   Status: {status} | Stage: {stage}")
+        if error:
+            lines.append(f"   Error: {error[:60]}")
+        lines.append(f"   Time: {dispatched}")
+        lines.append("")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def github_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
         return
@@ -2434,6 +2501,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("queue_pause", queue_pause_cmd))
     app.add_handler(CommandHandler("queue_resume", queue_resume_cmd))
     app.add_handler(CommandHandler("queue_cancel", queue_cancel_cmd))
+    app.add_handler(CommandHandler("worker_status", worker_status))
     app.add_handler(CommandHandler("bulk_upload", bulk_upload))
     app.add_handler(CommandHandler("import_trends", import_trends))
 
@@ -2665,6 +2733,60 @@ def test_dispatch():
         return {"status": "dispatched", "job_id": payload["job_id"], "outro_file_id": outro["file_id"]}
     except Exception as exc:
         return {"error": str(exc)}, 500
+
+
+@flask_app.route("/github_status", methods=["POST"])
+def github_status():
+    """Callback endpoint for GitHub Actions worker to report job status.
+    
+    Expected JSON body:
+    {
+        "job_id": "...",
+        "status": "downloading|rendering|uploading|completed|failed",
+        "stage": "description of current stage",
+        "error_message": "optional error text"
+    }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        job_id = data.get("job_id", "")
+        status = data.get("status", "")
+        stage = data.get("stage", "")
+        error_message = data.get("error_message", "")
+
+        if not job_id or not status:
+            return {"error": "job_id and status required"}, 400
+
+        from agents.db import execute
+        now = dt.datetime.now().isoformat()
+        execute(
+            """UPDATE github_jobs
+               SET status = ?, stage = ?, error_message = ?, updated_at = ?
+               WHERE job_id = ?""",
+            (status, stage, error_message, now, job_id)
+        )
+
+        # Notify user via Telegram if bot is ready
+        if telegram_app and BOT_LOOP:
+            # Find chat_id from job_id pattern: user_id-timestamp
+            try:
+                user_id = int(job_id.split("-")[0])
+                icon = "✅" if status == "completed" else "❌" if status == "failed" else "🔄"
+                msg = f"{icon} GitHub Worker Update\n\nJob: {job_id}\nStatus: {status}\nStage: {stage}"
+                if error_message:
+                    msg += f"\nError: {error_message[:100]}"
+                asyncio.run_coroutine_threadsafe(
+                    telegram_app.bot.send_message(chat_id=user_id, text=msg),
+                    BOT_LOOP,
+                )
+            except Exception as e:
+                print(f"[GITHUB_STATUS] Notify failed: {e}", flush=True)
+
+        return {"status": "ok", "job_id": job_id}
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
 
 def main() -> None:
     global telegram_app

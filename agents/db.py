@@ -234,6 +234,18 @@ def _pg_ddl(table_name: str) -> str:
                 last_updated TEXT
             )
         """,
+        "github_jobs": """
+            CREATE TABLE IF NOT EXISTS github_jobs (
+                id SERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL UNIQUE,
+                song_name TEXT NOT NULL,
+                status TEXT DEFAULT 'dispatched',
+                stage TEXT DEFAULT 'queued',
+                error_message TEXT,
+                dispatched_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
     }
     return ddls.get(table_name, "")
 
@@ -341,6 +353,18 @@ def _sqlite_ddl(table_name: str) -> str:
                 last_updated TEXT
             )
         """,
+        "github_jobs": """
+            CREATE TABLE IF NOT EXISTS github_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL UNIQUE,
+                song_name TEXT NOT NULL,
+                status TEXT DEFAULT 'dispatched',
+                stage TEXT DEFAULT 'queued',
+                error_message TEXT,
+                dispatched_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
     }
     return ddls.get(table_name, "")
 
@@ -353,7 +377,7 @@ def init_all_tables() -> None:
         tables = [
             "trends", "upload_queue", "uploads", "outros",
             "outro_history", "queue_history", "system_state",
-            "auto_mode_config", "viral_trends",
+            "auto_mode_config", "viral_trends", "github_jobs",
         ]
         for table in tables:
             ddl = _pg_ddl(table) if USE_POSTGRES else _sqlite_ddl(table)
