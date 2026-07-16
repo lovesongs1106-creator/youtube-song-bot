@@ -44,7 +44,9 @@ def get_connection():
             import psycopg2
             return psycopg2.connect(DATABASE_URL)
         except ImportError:
-            pass
+            print("[DB] psycopg2 not installed, falling back to SQLite", flush=True)
+        except Exception as e:
+            print(f"[DB] PostgreSQL connection failed: {e}, falling back to SQLite", flush=True)
     # SQLite fallback
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(DB_PATH)
