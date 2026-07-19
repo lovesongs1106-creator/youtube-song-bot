@@ -2940,6 +2940,20 @@ def toggle_queue():
     return "OK", 200
 
 
+@flask_app.route("/db_status")
+def db_status():
+    """Show current database backend and persistence status. Restored from 0c45a39."""
+    from agents.db import is_using_postgres, DATABASE_URL, DB_PATH, _FORCE_SQLITE
+    from pathlib import Path
+    return {
+        "backend": "postgresql" if is_using_postgres() else "sqlite",
+        "database_url_set": bool(DATABASE_URL),
+        "sqlite_path": DB_PATH,
+        "sqlite_exists": Path(DB_PATH).exists(),
+        "fallback_active": _FORCE_SQLITE,
+        "persistence_warning": "SQLite is ephemeral on Render. Set DATABASE_URL env var to use PostgreSQL (Supabase/etc) for persistent storage.",
+    }
+
 @flask_app.route("/system_health")
 def system_health():
     if not ENABLE_SYSTEM_HEALTH:

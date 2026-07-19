@@ -27,7 +27,7 @@ from pathlib import Path
 # Add parent to path so we can import agents.db
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agents.db import DATABASE_URL, USE_POSTGRES, get_connection, init_all_tables
+from agents.db import DATABASE_URL, is_using_postgres, get_connection, init_all_tables
 
 SQLITE_PATH = Path("storage/trends.db")
 
@@ -129,7 +129,7 @@ def main() -> None:
         print("   Set it to your PostgreSQL connection string and retry.")
         sys.exit(1)
 
-    if not USE_POSTGRES:
+    if not is_using_postgres():
         print(f"❌ DATABASE_URL does not look like a PostgreSQL URL: {DATABASE_URL[:20]}...")
         sys.exit(1)
 

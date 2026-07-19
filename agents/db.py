@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 DB_PATH = "storage/trends.db"
+_FORCE_SQLITE = False
 
 # Detect if PostgreSQL is available
 # DEFAULT_URL is Sydney Pooler for ap-southeast-2
