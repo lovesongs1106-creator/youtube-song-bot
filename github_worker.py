@@ -37,6 +37,7 @@ JOB_DIR.mkdir(exist_ok=True)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 YOUTUBE_TOKEN_JSON = os.environ.get("YOUTUBE_TOKEN_JSON", "").strip()
 GOOGLE_CLIENT_SECRETS_JSON = os.environ.get("GOOGLE_CLIENT_SECRETS_JSON", "").strip()
+YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "").strip()
 
 
 def log(msg: str) -> None:
@@ -174,6 +175,8 @@ def main() -> None:
         else:
             if not youtube_url:
                 raise RuntimeError("youtube_url missing for source_type=youtube_url")
+            if not YOUTUBE_COOKIES:
+                log("YOUTUBE_COOKIES secret missing")
             send_message(chat_id, "⬇️ YouTube audio download try kar raha hoon GitHub worker par...")
             try:
                 audio_path = download_youtube_audio(youtube_url, job_dir / "downloaded_audio")

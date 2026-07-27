@@ -201,35 +201,54 @@ def download_youtube_audio(youtube_url: str, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     outtmpl = output_dir / "source_audio.%(ext)s"
 
-    # Prefer command-line yt-dlp because it is easier for users to update/debug.
-    if shutil.which("yt-dlp"):
-        run([
-            "yt-dlp",
-            "--no-playlist",
-            "--extract-audio",
-            "--audio-format", "mp3",
-            "--audio-quality", "0",
-            "--output", str(outtmpl),
-            youtube_url,
-        ])
-    else:
-        try:
-            import yt_dlp
-        except ImportError as exc:
-            raise SystemExit("Install yt-dlp first: pip install -r requirements.txt") from exc
+    cookies_text = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    cookies_path = output_dir / "cookies.txt"
+    wrote_cookies = False
 
-        opts = {
-            "format": "bestaudio/best",
-            "noplaylist": True,
-            "outtmpl": str(outtmpl),
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "0",
-            }],
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([youtube_url])
+    if cookies_text:
+        cookies_path.write_text(cookies_text, encoding="utf-8")
+        wrote_cookies = True
+    else:
+        print("YOUTUBE_COOKIES secret missing")
+
+    try:
+        # Prefer command-line yt-dlp because it is easier for users to update/debug.
+        if shutil.which("yt-dlp"):
+            cmd = [
+                "yt-dlp",
+                "--no-playlist",
+                "--extract-audio",
+                "--audio-format", "mp3",
+                "--audio-quality", "0",
+                "--output", str(outtmpl),
+            ]
+            if wrote_cookies:
+                cmd += ["--cookies", str(cookies_path)]
+            cmd.append(youtube_url)
+            run(cmd)
+        else:
+            try:
+                import yt_dlp
+            except ImportError as exc:
+                raise SystemExit("Install yt-dlp first: pip install -r requirements.txt") from exc
+
+            opts = {
+                "format": "bestaudio/best",
+                "noplaylist": True,
+                "outtmpl": str(outtmpl),
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "0",
+                }],
+            }
+            if wrote_cookies:
+                opts["cookies"] = str(cookies_path)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([youtube_url])
+    finally:
+        if cookies_path.exists():
+            cookies_path.unlink()
 
     candidates = sorted(output_dir.glob("source_audio.*"))
     mp3s = [c for c in candidates if c.suffix.lower() == ".mp3"]

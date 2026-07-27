@@ -13,6 +13,7 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       YOUTUBE_TOKEN_JSON: ${{ secrets.YOUTUBE_TOKEN_JSON }}
       GOOGLE_CLIENT_SECRETS_JSON: ${{ secrets.GOOGLE_CLIENT_SECRETS_JSON }}
+      YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
       VIDEO_WIDTH: ${{ vars.VIDEO_WIDTH || '1920' }}
       VIDEO_HEIGHT: ${{ vars.VIDEO_HEIGHT || '1080' }}
       VIDEO_FPS: ${{ vars.VIDEO_FPS || '30' }}
