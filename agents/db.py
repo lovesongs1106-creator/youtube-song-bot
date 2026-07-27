@@ -389,15 +389,17 @@ def init_all_tables() -> None:
             "outro_history", "queue_history", "system_state",
             "auto_mode_config", "viral_trends", "github_jobs",
         ]
+        # Use actual connection type, not is_using_postgres()
+        using_pg = not isinstance(conn, sqlite3.Connection)
         for table in tables:
-            ddl = _pg_ddl(table) if is_using_postgres() else _sqlite_ddl(table)
+            ddl = _pg_ddl(table) if using_pg else _sqlite_ddl(table)
             if ddl:
                 c.execute(ddl)
 
         conn.commit()
 
         # Insert default auto_mode_config if not exists
-        if is_using_postgres():
+        if using_pg:
             c.execute(
                 """INSERT INTO auto_mode_config (id, enabled, uploads_per_day, start_time)
                    VALUES (1, 0, 3, '06:00')
