@@ -1613,8 +1613,13 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not GOOGLE_CLIENT_SECRETS_PATH.exists():
         await update.message.reply_text(
-            "Google OAuth config missing. Hosting env me GOOGLE_CLIENT_SECRETS_JSON add karo "
-            "ya client_secrets.json file deploy karo."
+            "❌ Google OAuth config missing.\n\n"
+            "Add this to Render Environment Variables:\n"
+            "Name: GOOGLE_CLIENT_SECRETS_JSON\n"
+            "Value: Your Google Cloud OAuth 2.0 client JSON\n\n"
+            "Expected format:\n"
+            '{"web":{"client_id":"...","client_secret":"...","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token"}}\n\n'
+            "Or upload client_secrets.json to the repo root."
         )
         return
     if not BASE_URL:
@@ -2932,6 +2937,16 @@ def main() -> None:
         print("[STARTUP] Initializing tables...", flush=True)
         init_all_tables()
         print("[STARTUP] Tables initialized", flush=True)
+
+        # OAuth config check
+        oauth_env_set = bool(os.environ.get("GOOGLE_CLIENT_SECRETS_JSON", "").strip())
+        oauth_file_exists = GOOGLE_CLIENT_SECRETS_PATH.exists()
+        if oauth_env_set or oauth_file_exists:
+            print(f"[STARTUP] OAuth config OK (env_var={oauth_env_set}, file={oauth_file_exists})", flush=True)
+        else:
+            print("[STARTUP] WARNING: OAuth config missing. /auth and /new will not work.", flush=True)
+            print("[STARTUP] Set GOOGLE_CLIENT_SECRETS_JSON env var or deploy client_secrets.json", flush=True)
+            print("[STARTUP] Expected format: JSON with 'web' key containing client_id, client_secret, auth_uri, token_uri", flush=True)
 
         print("[STARTUP] Building Telegram app...", flush=True)
         telegram_app = build_telegram_app()
