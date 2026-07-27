@@ -140,18 +140,32 @@ def _download_with_ytdlp(youtube_url: str, output_dir: Path) -> Optional[Path]:
     else:
         print("YOUTUBE_COOKIES secret missing")
 
+    # Common yt-dlp args to bypass TV client signature challenge
+    extractor_args = [
+        "--extractor-args", "youtube:player_client=web",
+    ]
+
     try:
-        # Log available formats
+        # Log available formats (with web client)
         print(f"\n=== yt-dlp format list for {youtube_url} ===")
         if shutil.which("yt-dlp"):
-            list_cmd = ["yt-dlp", "--no-playlist", "--list-formats", youtube_url]
+            list_cmd = [
+                "yt-dlp", "--no-playlist",
+                *extractor_args,
+                "--list-formats", youtube_url,
+            ]
             if wrote_cookies:
                 list_cmd += ["--cookies", str(cookies_path)]
             subprocess.run(list_cmd, check=False)
         else:
             try:
                 import yt_dlp
-                list_opts = {"quiet": False, "noplaylist": True, "skip_download": True}
+                list_opts = {
+                    "quiet": False,
+                    "noplaylist": True,
+                    "skip_download": True,
+                    "extractor_args": {"youtube": {"player_client": "web"}},
+                }
                 if wrote_cookies:
                     list_opts["cookies"] = str(cookies_path)
                 with yt_dlp.YoutubeDL(list_opts) as ydl:
@@ -164,37 +178,49 @@ def _download_with_ytdlp(youtube_url: str, output_dir: Path) -> Optional[Path]:
                 print(f"Could not list formats: {list_exc}")
         print("=== end format list ===\n")
 
-        # Download best available audio
+        # Download best available audio (with web client)
         if shutil.which("yt-dlp"):
             cmd = [
                 "yt-dlp",
                 "--no-playlist",
+                *extractor_args,
                 "-f", "ba/b",
                 "--output", str(outtmpl),
             ]
             if wrote_cookies:
                 cmd += ["--cookies", str(cookies_path)]
             cmd.append(youtube_url)
-            _run(cmd)
+            print("\n$ " + " ".join(map(str, cmd)))
+            proc = subprocess.run(cmd)
+            if proc.returncode != 0:
+                print(f"yt-dlp exited with code {proc.returncode}")
+                return None
         else:
             try:
                 import yt_dlp
             except ImportError as exc:
-                raise SystemExit("Install yt-dlp first: pip install -r requirements.txt") from exc
+                print(f"yt-dlp not installed: {exc}")
+                return None
 
             opts = {
                 "format": "ba/b",
                 "noplaylist": True,
                 "outtmpl": str(outtmpl),
+                "extractor_args": {"youtube": {"player_client": "web"}},
             }
             if wrote_cookies:
                 opts["cookies"] = str(cookies_path)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([youtube_url])
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([youtube_url])
+            except Exception as exc:
+                print(f"yt-dlp download failed: {exc}")
+                return None
 
         candidates = sorted(output_dir.glob("source_audio.*"))
         if not candidates:
-            raise SystemExit("ERROR: No playable audio formats found for this YouTube URL.")
+            print("ERROR: No playable audio formats found for this YouTube URL.")
+            return None
 
         downloaded = candidates[0]
         print(f"Downloaded raw audio: {downloaded}")

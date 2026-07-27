@@ -102,6 +102,18 @@ jobs:
           curl -s http://localhost:9000/ || echo "Cobalt health check failed"
           echo "======================================="
 
+      - name: Test Cobalt with a public video
+        run: |
+          echo "=== Testing Cobalt with Rick Astley (public video) ==="
+          curl -X POST http://localhost:9000/ \
+            -H "Content-Type: application/json" \
+            -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","downloadMode":"audio","audioFormat":"mp3"}' \
+            -v || true
+          echo ""
+          echo "=== Cobalt container logs ==="
+          docker logs cobalt-api --tail 50 || true
+          echo "======================================="
+
       - name: Render and upload
         env:
           COBALT_API_URL: http://localhost:9000/
