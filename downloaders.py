@@ -10,6 +10,7 @@ If both fail: raises RuntimeError with a clean message for Telegram.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -59,7 +60,9 @@ def _download_file(url: str, dest: Path, timeout: int = 300) -> Path:
 
 def _download_with_cobalt(youtube_url: str, output_dir: Path) -> Optional[Path]:
     """Try downloading audio via Cobalt API. Returns MP3 Path or None on failure."""
-    cobalt_url = os.environ.get("COBALT_API_URL", "https://api.cobalt.tools/api/json").rstrip("/")
+    # Current Cobalt API uses POST / (root). The old /api/json endpoint was shut down in v7.
+    # User should set COBALT_API_URL to their self-hosted instance, e.g. https://cobalt.example.com/
+    cobalt_url = os.environ.get("COBALT_API_URL", "https://api.cobalt.tools/").rstrip("/") + "/"
     payload = {
         "url": youtube_url,
         "downloadMode": "audio",
@@ -71,17 +74,30 @@ def _download_with_cobalt(youtube_url: str, output_dir: Path) -> Optional[Path]:
     }
 
     print(f"[DOWNLOADER] Trying Cobalt API: {cobalt_url}")
+    print(f"[DOWNLOADER] Request JSON: {json.dumps(payload, indent=2)}")
+    print(f"[DOWNLOADER] Request headers: {json.dumps(headers, indent=2)}")
+
     try:
         r = requests.post(cobalt_url, json=payload, headers=headers, timeout=60)
+        print(f"[DOWNLOADER] Response status: {r.status_code}")
+        print(f"[DOWNLOADER] Response body: {r.text}")
         r.raise_for_status()
         data = r.json()
+    except requests.HTTPError as exc:
+        print(f"[DOWNLOADER] Cobalt API HTTP error: {exc}")
+        return None
     except Exception as exc:
         print(f"[DOWNLOADER] Cobalt API request failed: {exc}")
         return None
 
     status = data.get("status", "")
     if status == "error":
-        print(f"[DOWNLOADER] Cobalt API returned error: {data.get('text', 'unknown')}")
+        # New schema: {"status":"error","error":{"code":"..."}}
+        # Old schema fallback: {"status":"error","text":"..."}
+        error_detail = data.get("error", {})
+        error_code = error_detail.get("code") if isinstance(error_detail, dict) else None
+        error_text = data.get("text") or error_code or "unknown"
+        print(f"[DOWNLOADER] Cobalt API returned error: {error_text}")
         return None
 
     download_url = data.get("url")
