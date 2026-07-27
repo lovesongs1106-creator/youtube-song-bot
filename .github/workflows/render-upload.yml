@@ -63,15 +63,14 @@ jobs:
           echo "=== YOUTUBE_COOKIES Audit ==="
           if [ -n "$YOUTUBE_COOKIES" ]; then
             echo "Secret exists: YES"
-            echo "$YOUTUBE_COOKIES" > /tmp/cookies_audit.txt
-            echo "Cookie file size: $(wc -c < /tmp/cookies_audit.txt) bytes"
-            FIRST_LINE=$(head -n 1 /tmp/cookies_audit.txt)
+            echo "$YOUTUBE_COOKIES" > /tmp/youtube_cookies.txt
+            echo "Cookie file size: $(wc -c < /tmp/youtube_cookies.txt) bytes"
+            FIRST_LINE=$(head -n 1 /tmp/youtube_cookies.txt)
             if echo "$FIRST_LINE" | grep -q "^# Netscape HTTP Cookie File"; then
               echo "Cookie format: VALID (Netscape header found)"
             else
               echo "Cookie format: INVALID (first line: $FIRST_LINE)"
             fi
-            rm -f /tmp/cookies_audit.txt
           else
             echo "Secret exists: NO"
             echo "Cookie file size: 0 bytes"
@@ -79,5 +78,30 @@ jobs:
           fi
           echo "=============================="
 
+      - name: Start local Cobalt API with cookies
+        run: |
+          echo "=== Starting local Cobalt Docker container ==="
+          docker run -d \
+            --name cobalt-api \
+            -p 9000:9000 \
+            -e API_URL=http://localhost:9000 \
+            -e COOKIE_PATH=/app/cookies.txt \
+            -v /tmp/youtube_cookies.txt:/app/cookies.txt:ro \
+            ghcr.io/imputnet/cobalt:main
+          echo "Waiting for Cobalt to be ready..."
+          for i in {1..30}; do
+            if curl -sf http://localhost:9000/ > /dev/null 2>&1; then
+              echo "Cobalt is ready!"
+              break
+            fi
+            echo "Attempt $i/30..."
+            sleep 2
+          done
+          echo "Cobalt health check:"
+          curl -s http://localhost:9000/ || echo "Cobalt health check failed"
+          echo "======================================="
+
       - name: Render and upload
+        env:
+          COBALT_API_URL: http://localhost:9000/
         run: python github_worker.py
