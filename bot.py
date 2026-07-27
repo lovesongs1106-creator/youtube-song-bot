@@ -192,107 +192,13 @@ def generate_thumbnail(song_name: str, artist: Optional[str], output: Path, size
 
 
 def download_youtube_audio(youtube_url: str, output_dir: Path) -> Path:
-    """Download/extract audio from a YouTube URL using yt-dlp.
+    """Download/extract audio from a YouTube URL.
 
+    Uses Cobalt API first, then yt-dlp fallback.
     Only use this for content you own, have licensed, or have explicit permission to reuse.
-    This function does not bypass DRM; it relies on yt-dlp/FFmpeg for normal extraction.
     """
-    check_ffmpeg()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    outtmpl = output_dir / "source_audio.%(ext)s"
-
-    cookies_text = os.environ.get("YOUTUBE_COOKIES", "").strip()
-    cookies_path = output_dir / "cookies.txt"
-    wrote_cookies = False
-
-    if cookies_text:
-        cookies_path.write_text(cookies_text, encoding="utf-8")
-        wrote_cookies = True
-    else:
-        print("YOUTUBE_COOKIES secret missing")
-
-    try:
-        # 1) Log available formats so workflow logs show what YouTube is serving.
-        print(f"\n=== yt-dlp format list for {youtube_url} ===")
-        if shutil.which("yt-dlp"):
-            list_cmd = ["yt-dlp", "--no-playlist", "--list-formats", youtube_url]
-            if wrote_cookies:
-                list_cmd += ["--cookies", str(cookies_path)]
-            subprocess.run(list_cmd, check=False)
-        else:
-            try:
-                import yt_dlp
-                list_opts = {"quiet": False, "noplaylist": True, "skip_download": True}
-                if wrote_cookies:
-                    list_opts["cookies"] = str(cookies_path)
-                with yt_dlp.YoutubeDL(list_opts) as ydl:
-                    info = ydl.extract_info(youtube_url, download=False)
-                    if info and info.get("formats"):
-                        print("Available formats:")
-                        for f in info.get("formats", []):
-                            print(f"  {f.get('format_id'):>4}  {f.get('ext'):<5}  {f.get('resolution','audio only'):<12}  {f.get('abr',''):>5}  {f.get('acodec',''):<8}  {f.get('vcodec',''):<8}")
-            except Exception as list_exc:
-                print(f"Could not list formats: {list_exc}")
-        print("=== end format list ===\n")
-
-        # 2) Download best available audio (do NOT assume MP3 exists).
-        if shutil.which("yt-dlp"):
-            cmd = [
-                "yt-dlp",
-                "--no-playlist",
-                "-f", "ba/b",
-                "--output", str(outtmpl),
-            ]
-            if wrote_cookies:
-                cmd += ["--cookies", str(cookies_path)]
-            cmd.append(youtube_url)
-            run(cmd)
-        else:
-            try:
-                import yt_dlp
-            except ImportError as exc:
-                raise SystemExit("Install yt-dlp first: pip install -r requirements.txt") from exc
-
-            opts = {
-                "format": "ba/b",
-                "noplaylist": True,
-                "outtmpl": str(outtmpl),
-            }
-            if wrote_cookies:
-                opts["cookies"] = str(cookies_path)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([youtube_url])
-
-        # 3) Find whatever was downloaded.
-        candidates = sorted(output_dir.glob("source_audio.*"))
-        if not candidates:
-            raise SystemExit("ERROR: No playable audio formats found for this YouTube URL.")
-
-        downloaded = candidates[0]
-        print(f"Downloaded raw audio: {downloaded}")
-
-        # 4) Convert to MP3 with FFmpeg (do NOT rely on yt-dlp postprocessors).
-        mp3_path = output_dir / "source_audio.mp3"
-        print(f"Converting to MP3 with FFmpeg: {downloaded} -> {mp3_path}")
-        run([
-            "ffmpeg", "-y",
-            "-i", str(downloaded),
-            "-vn",
-            "-c:a", "libmp3lame",
-            "-q:a", "2",
-            str(mp3_path),
-        ])
-
-        # Remove raw non-MP3 file to keep workspace clean.
-        if downloaded != mp3_path:
-            downloaded.unlink()
-            print(f"Removed raw file: {downloaded}")
-
-        print(f"Final MP3 audio: {mp3_path}")
-        return mp3_path
-    finally:
-        if cookies_path.exists():
-            cookies_path.unlink()
+    from downloaders import download_audio
+    return download_audio(youtube_url, output_dir)
 
 
 def get_youtube_title(youtube_url: str) -> Optional[str]:
