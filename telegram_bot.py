@@ -2766,6 +2766,31 @@ def debug_callback():
         return {"error": str(exc), "trace": traceback.format_exc()}, 500
 
 
+@flask_app.route("/seed_outro", methods=["POST"])
+def seed_outro():
+    """Seed a test outro for QA verification. Protected by webhook secret."""
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if secret != WEBHOOK_SECRET:
+        return {"error": "Unauthorized"}, 401
+    
+    from agents.db import execute
+    from datetime import datetime
+    
+    execute(
+        """INSERT INTO outros (name, file_id, file_unique_id, ext, weight, is_active, added_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(file_id) DO UPDATE SET
+               name=excluded.name,
+               file_unique_id=excluded.file_unique_id,
+               ext=excluded.ext,
+               weight=excluded.weight,
+               is_active=1""",
+        ("QA Test Outro", "test_file_id_001", "test_unique_id_001", ".mp4", 10, 1, datetime.now().isoformat())
+    )
+    
+    return {"status": "ok", "message": "Test outro seeded"}
+
+
 @flask_app.route("/seed_trends", methods=["POST"])
 def seed_trends():
     """Seed test trends for Phase 1 verification. Protected by webhook secret."""
