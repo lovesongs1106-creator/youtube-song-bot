@@ -150,6 +150,18 @@ def upload_to_youtube(video_file: Path, thumbnail_file: Path, metadata: dict[str
     return video_id
 
 
+def verify_cookies() -> tuple[bool, str]:
+    """Audit YOUTUBE_COOKIES env var and return (ok, diagnostic_message)."""
+    cookies_text = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if not cookies_text:
+        return False, "YOUTUBE_COOKIES audit: Secret exists: NO | Cookie file size: 0 bytes | Cookie format: MISSING"
+    size = len(cookies_text.encode("utf-8"))
+    first_line = cookies_text.splitlines()[0] if cookies_text else ""
+    if first_line.startswith("# Netscape HTTP Cookie File"):
+        return True, f"YOUTUBE_COOKIES audit: Secret exists: YES | Cookie file size: {size} bytes | Cookie format: VALID (Netscape header found)"
+    return False, f"YOUTUBE_COOKIES audit: Secret exists: YES | Cookie file size: {size} bytes | Cookie format: INVALID (first line: {first_line[:60]})"
+
+
 def main() -> None:
     payload = read_payload()
     chat_id = payload["chat_id"]
@@ -161,6 +173,16 @@ def main() -> None:
     youtube_url = payload.get("youtube_url")
 
     send_message(chat_id, f"🚀 GitHub worker started for: {song_name}\nJob: {job_id}")
+
+    # Environment audit
+    log("=== GitHub Worker Environment Audit ===")
+    log(f"yt-dlp version: {os.popen('yt-dlp --version').read().strip()}")
+    log(f"python version: {sys.version.split()[0]}")
+    log(f"node version: {os.popen('node --version').read().strip()}")
+    log(f"ffmpeg version: {os.popen('ffmpeg -version').read().splitlines()[0]}")
+    cookies_ok, cookies_diag = verify_cookies()
+    log(cookies_diag)
+    log("=======================================")
 
     try:
         job_dir = JOB_DIR / job_id

@@ -43,5 +43,40 @@ jobs:
           python -m pip install --upgrade yt-dlp
           yt-dlp --version
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Environment audit
+        run: |
+          echo "=== Environment Audit ==="
+          echo "yt-dlp version: $(yt-dlp --version)"
+          echo "python version: $(python --version)"
+          echo "node version: $(node --version)"
+          echo "ffmpeg version: $(ffmpeg -version | head -n 1)"
+          echo "========================="
+
+      - name: Verify YOUTUBE_COOKIES secret
+        run: |
+          echo "=== YOUTUBE_COOKIES Audit ==="
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "Secret exists: YES"
+            echo "$YOUTUBE_COOKIES" > /tmp/cookies_audit.txt
+            echo "Cookie file size: $(wc -c < /tmp/cookies_audit.txt) bytes"
+            FIRST_LINE=$(head -n 1 /tmp/cookies_audit.txt)
+            if echo "$FIRST_LINE" | grep -q "^# Netscape HTTP Cookie File"; then
+              echo "Cookie format: VALID (Netscape header found)"
+            else
+              echo "Cookie format: INVALID (first line: $FIRST_LINE)"
+            fi
+            rm -f /tmp/cookies_audit.txt
+          else
+            echo "Secret exists: NO"
+            echo "Cookie file size: 0 bytes"
+            echo "Cookie format: MISSING"
+          fi
+          echo "=============================="
+
       - name: Render and upload
         run: python github_worker.py

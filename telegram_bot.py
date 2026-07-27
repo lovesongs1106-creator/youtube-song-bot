@@ -414,6 +414,10 @@ async def outro_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     outro_name = custom_name or Path(name).stem or "outro"
     outro_id = add_outro(outro_name, file_id, ext, weight)
+    from agents.db import is_using_postgres
+    ephemeral_warning = ""
+    if not is_using_postgres():
+        ephemeral_warning = "\n\n⚠️ WARNING: SQLite ephemeral storage active. Outros will be lost when Render restarts. Add DATABASE_URL env var for persistence."
     await update.message.reply_text(
         f"✅ Outro added!\n\n"
         f"ID: {outro_id}\n"
@@ -421,6 +425,7 @@ async def outro_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Weight: {weight}\n"
         f"Ext: {ext}\n\n"
         f"Total active outros: {len(list_outros())}"
+        f"{ephemeral_warning}"
     )
 
 
@@ -1014,6 +1019,10 @@ async def receive_outro_weight(update: Update, context: ContextTypes.DEFAULT_TYP
         file_unique_id=context.user_data.get("outro_file_unique_id"),
     )
 
+    from agents.db import is_using_postgres
+    ephemeral_warning = ""
+    if not is_using_postgres():
+        ephemeral_warning = "\n\n⚠️ WARNING: SQLite ephemeral storage active. Outros will be lost when Render restarts. Add DATABASE_URL env var for persistence."
     await update.message.reply_text(
         f"✅ Outro added!\n\n"
         f"ID: {outro_id}\n"
@@ -1021,6 +1030,7 @@ async def receive_outro_weight(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Weight: {weight}\n"
         f"Ext: {context.user_data['outro_ext']}\n\n"
         f"Total active outros: {len(list_outros())}"
+        f"{ephemeral_warning}"
     )
     return ConversationHandler.END
 
@@ -1092,6 +1102,10 @@ async def outro_add_single_shot(update: Update, context: ContextTypes.DEFAULT_TY
         name = Path(target_msg.document.file_name if target_msg.document else "outro").stem or "Outro"
 
     outro_id = add_outro(name=name, file_id=file_id, ext=ext, weight=weight, file_unique_id=file_unique_id)
+    from agents.db import is_using_postgres
+    ephemeral_warning = ""
+    if not is_using_postgres():
+        ephemeral_warning = "\n\n⚠️ WARNING: SQLite ephemeral storage active. Outros will be lost when Render restarts. Add DATABASE_URL env var for persistence."
     await update.message.reply_text(
         f"✅ Outro added!\n\n"
         f"ID: {outro_id}\n"
@@ -1100,6 +1114,7 @@ async def outro_add_single_shot(update: Update, context: ContextTypes.DEFAULT_TY
         f"File ID: `{file_id}`\n"
         f"Ext: {ext}\n\n"
         f"Total active outros: {len(list_outros())}"
+        f"{ephemeral_warning}"
     )
 
 
@@ -2040,6 +2055,17 @@ async def collect_asset_or_text(update: Update, context: ContextTypes.DEFAULT_TY
     if msg.video:
         context.user_data["outro_file_id"] = msg.video.file_id
         context.user_data["outro_ext"] = ".mp4"
+        # Auto-save outro to DB so user doesn't have to re-upload
+        try:
+            add_outro(
+                name="Auto-saved Outro",
+                file_id=msg.video.file_id,
+                ext=".mp4",
+                weight=10,
+                file_unique_id=msg.video.file_unique_id,
+            )
+        except Exception as e:
+            print(f"[OUTRO_AUTO_SAVE] failed: {e}", flush=True)
         await update.message.reply_text("Outro video saved ✅")
         await maybe_dispatch_if_ready(update, context)
         return WAITING_LINK
@@ -2062,6 +2088,17 @@ async def collect_asset_or_text(update: Update, context: ContextTypes.DEFAULT_TY
         elif ext in {".mp4", ".mov", ".mkv", ".webm"} or mime.startswith("video/"):
             context.user_data["outro_file_id"] = msg.document.file_id
             context.user_data["outro_ext"] = ext or ".mp4"
+            # Auto-save outro to DB so user doesn't have to re-upload
+            try:
+                add_outro(
+                    name=Path(name).stem or "Auto-saved Outro",
+                    file_id=msg.document.file_id,
+                    ext=ext or ".mp4",
+                    weight=10,
+                    file_unique_id=msg.document.file_unique_id,
+                )
+            except Exception as e:
+                print(f"[OUTRO_AUTO_SAVE] failed: {e}", flush=True)
             await update.message.reply_text("Outro video saved ✅")
         else:
             await update.message.reply_text("File type samajh nahi aaya. Image/audio/outro video bhejo.")
@@ -2136,16 +2173,31 @@ async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     tg_file_id = None
     ext = ".mp4"
+    file_unique_id = None
     if update.message.video:
         tg_file_id = update.message.video.file_id
+        file_unique_id = update.message.video.file_unique_id
         ext = ".mp4"
     elif update.message.document:
         tg_file_id = update.message.document.file_id
+        file_unique_id = update.message.document.file_unique_id
         name = update.message.document.file_name or "outro.mp4"
         ext = Path(name).suffix or ".mp4"
     else:
         await update.message.reply_text("Please outro video file bhejo, text/photo nahi.")
         return WAITING_OUTRO
+
+    # Auto-save outro to DB so user doesn't have to re-upload via /outro_add
+    try:
+        add_outro(
+            name=Path(update.message.document.file_name or "outro").stem if update.message.document else "Auto-saved Outro",
+            file_id=tg_file_id,
+            ext=ext,
+            weight=10,
+            file_unique_id=file_unique_id,
+        )
+    except Exception as e:
+        print(f"[OUTRO_AUTO_SAVE] failed: {e}", flush=True)
 
     await update.message.reply_text("Outro mil gaya. Ab video generate + upload start kar raha hoon. Thoda time lagega.")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO)
