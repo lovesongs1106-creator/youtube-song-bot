@@ -38,5 +38,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Update yt-dlp to latest
+        run: |
+          python -m pip install --upgrade yt-dlp
+          yt-dlp --version
+
       - name: Render and upload
         run: python github_worker.py
