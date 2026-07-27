@@ -205,8 +205,13 @@ def main() -> None:
             except Exception as exc:
                 send_message(
                     chat_id,
-                    "⚠️ YouTube link se audio download fail ho gaya. Shayad human verification / bot check / restricted video issue hai.\n\n"
-                    "Same details repeat karne ki zaroorat nahi. Telegram bot me /audio_retry bhejo, phir sirf song audio file MP3/M4A bhej do. Thumbnail/outro/title saved rahenge.\n\n"
+                    "⚠️ YouTube audio download fail ho gaya.\n\n"
+                    "Cobalt API aur yt-dlp dono ne try kiya, par dono fail ho gaye.\n"
+                    "Reasons: restricted video, age-gate, ya YouTube ne block kar diya.\n\n"
+                    "Ab kya karna hai:\n"
+                    "1. Telegram bot me /audio_retry bhejo\n"
+                    "2. Sirf MP3/M4A audio file bhej do\n"
+                    "3. Thumbnail, outro, title sab saved rahenge\n\n"
                     f"Technical error: {exc}"
                 )
                 raise

@@ -214,6 +214,47 @@ def _download_with_ytdlp(youtube_url: str, output_dir: Path) -> Optional[Path]:
             cookies_path.unlink()
 
 
+def test_cobalt_connection(cobalt_url: str | None = None) -> tuple[bool, str]:
+    """Test connectivity to Cobalt API. Returns (ok, diagnostic_message)."""
+    url = (cobalt_url or os.environ.get("COBALT_API_URL", "https://api.cobalt.tools/")).rstrip("/") + "/"
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            version = data.get("cobalt", {}).get("version", "unknown")
+            services = data.get("cobalt", {}).get("services", [])
+            return True, f"Cobalt API OK (version {version}, services: {', '.join(services[:5])})"
+        return False, f"Cobalt API returned HTTP {r.status_code}"
+    except Exception as exc:
+        return False, f"Cobalt API unreachable: {exc}"
+
+
+def discover_cobalt_url() -> str | None:
+    """Auto-discover a working Cobalt instance.
+
+    Priority:
+      1. COBALT_API_URL env var
+      2. Local Docker instance at http://localhost:9000/
+      3. None (will use yt-dlp fallback)
+    """
+    env_url = os.environ.get("COBALT_API_URL", "").strip()
+    if env_url:
+        ok, msg = test_cobalt_connection(env_url)
+        print(f"[COBALT_DISCOVER] env URL {env_url}: {msg}")
+        if ok:
+            return env_url.rstrip("/") + "/"
+
+    local_url = "http://localhost:9000/"
+    ok, msg = test_cobalt_connection(local_url)
+    print(f"[COBALT_DISCOVER] local URL {local_url}: {msg}")
+    if ok:
+        os.environ["COBALT_API_URL"] = local_url
+        return local_url
+
+    print("[COBALT_DISCOVER] No working Cobalt instance found. Will fallback to yt-dlp.")
+    return None
+
+
 def download_audio(youtube_url: str, output_dir: Path) -> Path:
     """Download audio from YouTube URL using Cobalt API first, then yt-dlp fallback.
 
@@ -221,6 +262,10 @@ def download_audio(youtube_url: str, output_dir: Path) -> Path:
     Raises RuntimeError with a clean message if both methods fail.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Auto-discover Cobalt if not already configured
+    if not os.environ.get("COBALT_API_URL"):
+        discover_cobalt_url()
 
     # 1) Try Cobalt
     result = _download_with_cobalt(youtube_url, output_dir)
@@ -241,5 +286,6 @@ def download_audio(youtube_url: str, output_dir: Path) -> Path:
         "• Video is restricted, private, or age-gated\n"
         "• YouTube blocked the downloader IP\n"
         "• Video has no audio stream\n\n"
-        "Try /audio_retry and upload the audio file manually."
+        "Please upload the MP3/M4A audio file manually.\n"
+        "Use /audio_retry in Telegram — your thumbnail, outro, and title are already saved."
     )

@@ -3000,6 +3000,18 @@ def main() -> None:
             print("[STARTUP] Set GOOGLE_CLIENT_SECRETS_JSON env var or deploy client_secrets.json", flush=True)
             print("[STARTUP] Expected format: JSON with 'web' key containing client_id, client_secret, auth_uri, token_uri", flush=True)
 
+        # Cobalt connection test
+        print("[STARTUP] Testing Cobalt API connection...", flush=True)
+        from downloaders import test_cobalt_connection, discover_cobalt_url
+        discovered = discover_cobalt_url()
+        if discovered:
+            print(f"[STARTUP] Cobalt auto-configured: {discovered}", flush=True)
+        else:
+            cobalt_ok, cobalt_msg = test_cobalt_connection()
+            print(f"[STARTUP] Cobalt status: {cobalt_msg}", flush=True)
+            if not cobalt_ok:
+                print("[STARTUP] WARNING: Cobalt unavailable. yt-dlp fallback will be used.", flush=True)
+
         print("[STARTUP] Building Telegram app...", flush=True)
         telegram_app = build_telegram_app()
         print("[STARTUP] Telegram app built", flush=True)
@@ -3104,6 +3116,36 @@ def system_health():
         "backend": "postgresql" if is_using_postgres() else "sqlite",
         "fallback_active": _FORCE_SQLITE,
         "database_connected": db_ok
+    }
+
+@flask_app.route("/health")
+def health():
+    """Health check endpoint. Tests Cobalt API connectivity and database."""
+    from agents.db import is_using_postgres, _FORCE_SQLITE, get_connection
+    from downloaders import test_cobalt_connection
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT 1")
+        c.fetchone()
+        conn.close()
+        db_ok = True
+    except Exception:
+        db_ok = False
+
+    cobalt_ok, cobalt_msg = test_cobalt_connection()
+    status = "ok" if (db_ok and cobalt_ok) else "degraded" if db_ok else "error"
+    return {
+        "status": status,
+        "database": {
+            "connected": db_ok,
+            "backend": "postgresql" if is_using_postgres() else "sqlite",
+            "fallback_active": _FORCE_SQLITE,
+        },
+        "cobalt": {
+            "connected": cobalt_ok,
+            "message": cobalt_msg,
+        },
     }
 
 @flask_app.route("/dashboard")
