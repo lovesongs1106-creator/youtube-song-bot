@@ -85,9 +85,10 @@ jobs:
             --name cobalt-api \
             -p 9000:9000 \
             -e API_URL=http://localhost:9000 \
+            -e API_PORT=9000 \
             -e COOKIE_PATH=/app/cookies.txt \
             -v /tmp/youtube_cookies.txt:/app/cookies.txt:ro \
-            ghcr.io/imputnet/cobalt:main
+            ghcr.io/imputnet/cobalt:10
           echo "Waiting for Cobalt to be ready..."
           for i in {1..30}; do
             if curl -sf http://localhost:9000/ > /dev/null 2>&1; then
