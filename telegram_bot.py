@@ -2881,54 +2881,92 @@ def github_status():
 
 
 def main() -> None:
-    global telegram_app
-    if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN env var missing.")
+    import sys, traceback as tb_mod
+    try:
+        print(f"[STARTUP] Python version: {sys.version}", flush=True)
+        print(f"[STARTUP] Current commit: {_get_commit_hash()}", flush=True)
 
-    telegram_app = build_telegram_app()
+        global telegram_app
+        if not TELEGRAM_BOT_TOKEN:
+            print("[STARTUP] TELEGRAM_BOT_TOKEN missing.", flush=True)
+            raise SystemExit("TELEGRAM_BOT_TOKEN env var missing.")
 
-    if USE_WEBHOOK:
-        if not BASE_URL:
-            raise SystemExit("BASE_URL env var missing. Required for webhook mode.")
-        webhook_url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
+        print(f"[STARTUP] DATABASE_URL present? {'Yes' if os.environ.get('DATABASE_URL') else 'No'}", flush=True)
 
-        def bot_loop_thread() -> None:
-            global BOT_LOOP
-            # Initialize database tables first
-            init_all_tables()
-            print("[DB] All tables initialized", flush=True)
-            
-            loop = asyncio.new_event_loop()
-            BOT_LOOP = loop
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(telegram_app.initialize())
-            loop.run_until_complete(telegram_app.bot.delete_webhook(drop_pending_updates=True))
-            loop.run_until_complete(telegram_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES))
-            loop.run_until_complete(telegram_app.start())
-            print(f"Telegram webhook set: {webhook_url}", flush=True)
-            
-            # Start background queue processor
-            asyncio.run_coroutine_threadsafe(
-                run_queue_processor(telegram_app.bot, DEFAULT_PRIVACY, dispatch_github_worker),
-                loop,
-            )
-            print("[QUEUE] Background processor scheduled", flush=True)
+        from agents.db import is_using_postgres
+        backend = "PostgreSQL" if is_using_postgres() else "SQLite"
+        print(f"[STARTUP] Selected backend: {backend}", flush=True)
 
-            asyncio.run_coroutine_threadsafe(
-                run_auto_mode_scheduler(telegram_app.bot),
-                loop,
-            )
-            print("[AUTO_MODE] Scheduler started", flush=True)
-    
-            loop.run_forever()
+        print("[STARTUP] Connecting to database...", flush=True)
+        from agents.db import get_connection
+        conn = get_connection()
+        conn_type = type(conn).__name__
+        print(f"[STARTUP] Database connected ({conn_type})", flush=True)
+        conn.close()
 
-        thread = threading.Thread(target=bot_loop_thread, daemon=True)
-        thread.start()
-        run_flask()
-    else:
-        thread = threading.Thread(target=run_flask, daemon=True)
-        thread.start()
-        telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+        print("[STARTUP] Initializing tables...", flush=True)
+        init_all_tables()
+        print("[STARTUP] Tables initialized", flush=True)
+
+        print("[STARTUP] Building Telegram app...", flush=True)
+        telegram_app = build_telegram_app()
+        print("[STARTUP] Telegram app built", flush=True)
+
+        if USE_WEBHOOK:
+            if not BASE_URL:
+                print("[STARTUP] BASE_URL missing.", flush=True)
+                raise SystemExit("BASE_URL env var missing. Required for webhook mode.")
+            webhook_url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
+
+            def bot_loop_thread() -> None:
+                global BOT_LOOP
+                loop = asyncio.new_event_loop()
+                BOT_LOOP = loop
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(telegram_app.initialize())
+                loop.run_until_complete(telegram_app.bot.delete_webhook(drop_pending_updates=True))
+                loop.run_until_complete(telegram_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES))
+                loop.run_until_complete(telegram_app.start())
+                print(f"[STARTUP] Telegram webhook set: {webhook_url}", flush=True)
+                
+                print("[STARTUP] Starting queue processor...", flush=True)
+                asyncio.run_coroutine_threadsafe(
+                    run_queue_processor(telegram_app.bot, DEFAULT_PRIVACY, dispatch_github_worker),
+                    loop,
+                )
+                print("[STARTUP] Queue processor scheduled", flush=True)
+
+                print("[STARTUP] Starting scheduler...", flush=True)
+                asyncio.run_coroutine_threadsafe(
+                    run_auto_mode_scheduler(telegram_app.bot),
+                    loop,
+                )
+                print("[STARTUP] Scheduler started", flush=True)
+        
+                loop.run_forever()
+
+            print("[STARTUP] Starting bot thread...", flush=True)
+            thread = threading.Thread(target=bot_loop_thread, daemon=True)
+            thread.start()
+
+            port = int(os.environ.get("PORT", "8080"))
+            print(f"[STARTUP] Binding to PORT {port}...", flush=True)
+            print("[STARTUP] Application started successfully", flush=True)
+            flask_app.run(host="0.0.0.0", port=port)
+        else:
+            print("[STARTUP] Starting Flask thread...", flush=True)
+            thread = threading.Thread(target=run_flask, daemon=True)
+            thread.start()
+            print("[STARTUP] Application started successfully", flush=True)
+            telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception:
+        print("\n===== STARTUP ERROR =====", flush=True)
+        print(f"Exception type: {type(sys.exc_info()[1]).__name__}", flush=True)
+        print(f"Exception: {sys.exc_info()[1]}", flush=True)
+        print("Full traceback:", flush=True)
+        print(tb_mod.format_exc(), flush=True)
+        print("=========================\n", flush=True)
+        raise
 
 
 

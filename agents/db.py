@@ -17,16 +17,8 @@ from typing import Any
 DB_PATH = "storage/trends.db"
 _FORCE_SQLITE = False
 
-# Detect if PostgreSQL is available
-# DEFAULT_URL is Sydney Pooler for ap-southeast-2
-DEFAULT_URL = "postgresql://postgres.vckbjanbeovtqszsmfte:buzZug-mattym-jymby5@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres"
-DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_URL).strip()
-
-# FIX: Automatically convert Supabase IPv6 URL to IPv4 Pooler URL
-if "db.vckbjanbeovtqszsmfte.supabase.co" in DATABASE_URL or "vckbjanbeovtqszsmfte" in DATABASE_URL:
-    # Always force the working Sydney Pooler for this project ref
-    DATABASE_URL = "postgresql://postgres.vckbjanbeovtqszsmfte:buzZug-mattym-jymby5@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres"
-    print("[DB] Forcing IPv4 Pooler URL.", flush=True)
+# Detect if PostgreSQL is available — ONLY from environment, never hardcoded.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 def is_using_postgres():
     """Check if we are actually using PostgreSQL."""
@@ -47,8 +39,8 @@ def get_connection():
     if (DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres")) and not _FORCE_SQLITE:
         try:
             import psycopg2
-            # Add a 5 second timeout to avoid hanging startup
-            return psycopg2.connect(DATABASE_URL, connect_timeout=5)
+            # Short timeout to avoid hanging startup on Render health checks
+            return psycopg2.connect(DATABASE_URL, connect_timeout=2)
         except ImportError:
             print("[DB] psycopg2 not installed, falling back to SQLite", flush=True)
             _FORCE_SQLITE = True
