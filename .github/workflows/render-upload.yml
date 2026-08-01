@@ -78,7 +78,16 @@ jobs:
           fi
           echo "=============================="
 
-      - name: Start local Cobalt API with cookies
+      - name: Convert Netscape cookies to JSON for Cobalt
+        run: |
+          echo "=== Converting cookies to JSON format for Cobalt ==="
+          python convert_cookies.py /tmp/youtube_cookies.txt /tmp/youtube_cookies.json
+          echo "Cookie conversion done."
+          head -c 500 /tmp/youtube_cookies.json
+          echo ""
+          echo "======================================="
+
+      - name: Start local Cobalt API with JSON cookies
         run: |
           echo "=== Starting local Cobalt Docker container ==="
           docker run -d \
@@ -86,8 +95,8 @@ jobs:
             -p 9000:9000 \
             -e API_URL=http://localhost:9000 \
             -e API_PORT=9000 \
-            -e COOKIE_PATH=/app/cookies.txt \
-            -v /tmp/youtube_cookies.txt:/app/cookies.txt:ro \
+            -e COOKIE_PATH=/app/cookies.json \
+            -v /tmp/youtube_cookies.json:/app/cookies.json:ro \
             ghcr.io/imputnet/cobalt:10
           echo "Waiting for Cobalt to be ready..."
           for i in {1..30}; do
@@ -106,6 +115,7 @@ jobs:
         run: |
           echo "=== Testing Cobalt with Rick Astley (public video) ==="
           curl -X POST http://localhost:9000/ \
+            -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","downloadMode":"audio","audioFormat":"mp3"}' \
             -v || true
