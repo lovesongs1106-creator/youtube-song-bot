@@ -110,10 +110,39 @@ def get_youtube_service():
     creds = Credentials.from_authorized_user_info(token_info, YOUTUBE_UPLOAD_SCOPE)
     if not creds.valid:
         if creds.expired and creds.refresh_token:
-            creds.refresh(GoogleRequest())
+            try:
+                creds.refresh(GoogleRequest())
+            except Exception as refresh_exc:
+                # Catch invalid_grant and other refresh failures with a clear actionable message
+                err_str = str(refresh_exc).lower()
+                if "invalid_grant" in err_str:
+                    raise RuntimeError(
+                        "YouTube token EXPIRED/REVOKED (invalid_grant).\n\n"
+                        "FIX karo ye steps follow karke:\n"
+                        "1. Telegram bot me /auth bhejo\n"
+                        "2. Google login approve karo\n"
+                        "3. /export_youtube_token bhejo\n"
+                        "4. Jo file mile uska content copy karo\n"
+                        "5. GitHub repo > Settings > Secrets > YOUTUBE_TOKEN_JSON me paste karo\n\n"
+                        f"Technical detail: {refresh_exc}"
+                    )
+                raise RuntimeError(f"YouTube token refresh failed: {refresh_exc}")
         else:
             raise RuntimeError("YouTube token invalid/expired. Re-run /auth and update YOUTUBE_TOKEN_JSON secret.")
     return build("youtube", "v3", credentials=creds)
+
+
+def validate_youtube_token_early() -> tuple[bool, str]:
+    """Validate YouTube token before doing any heavy work. Returns (ok, message)."""
+    if not YOUTUBE_TOKEN_JSON:
+        return False, "YOUTUBE_TOKEN_JSON secret missing in GitHub repo."
+    try:
+        get_youtube_service()
+        return True, "YouTube token valid — upload ready."
+    except RuntimeError as exc:
+        return False, str(exc)
+    except Exception as exc:
+        return False, f"YouTube token validation error: {exc}"
 
 
 def upload_to_youtube(video_file: Path, thumbnail_file: Path, metadata: dict[str, Any], privacy: str) -> str:
@@ -183,6 +212,20 @@ def main() -> None:
     cookies_ok, cookies_diag = verify_cookies()
     log(cookies_diag)
     log("=======================================")
+
+    # EARLY TOKEN VALIDATION — fail fast before downloading/rendering
+    token_ok, token_msg = validate_youtube_token_early()
+    log(f"[TOKEN_CHECK] {token_msg}")
+    if not token_ok:
+        log(f"[TOKEN_CHECK] FAILED — aborting before heavy work.")
+        send_message(
+            chat_id,
+            f"❌ YouTube upload token INVALID.\n\n"
+            f"{token_msg}\n\n"
+            f"Job aborted early — no time wasted on download/render."
+        )
+        raise RuntimeError(token_msg)
+    send_message(chat_id, "🔑 YouTube token verified OK. Proceeding with download/render...")
 
     try:
         job_dir = JOB_DIR / job_id

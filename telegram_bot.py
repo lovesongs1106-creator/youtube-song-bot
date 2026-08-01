@@ -183,8 +183,22 @@ def youtube_authed_for_user(user_id: int):
     creds = Credentials.from_authorized_user_file(str(token_path), YOUTUBE_UPLOAD_SCOPE)
     if not creds.valid:
         if creds.expired and creds.refresh_token:
-            creds.refresh(GoogleRequest())
-            token_path.write_text(creds.to_json(), encoding="utf-8")
+            try:
+                creds.refresh(GoogleRequest())
+                token_path.write_text(creds.to_json(), encoding="utf-8")
+            except Exception as refresh_exc:
+                err_str = str(refresh_exc).lower()
+                if "invalid_grant" in err_str:
+                    raise RuntimeError(
+                        "YouTube token EXPIRED/REVOKED.\n\n"
+                        "FIX:\n"
+                        "1. /auth bhejo\n"
+                        "2. Google login karo\n"
+                        "3. /export_youtube_token bhejo\n"
+                        "4. GitHub Secret YOUTUBE_TOKEN_JSON me paste karo\n\n"
+                        f"Error: {refresh_exc}"
+                    )
+                raise RuntimeError(f"YouTube token refresh failed: {refresh_exc}")
         else:
             raise RuntimeError("YouTube token expired. Send /auth again.")
     return build("youtube", "v3", credentials=creds)
