@@ -35,6 +35,9 @@ def netscape_to_json(netscape_text: str) -> list[dict]:
                 expiration = 0
             name = parts[5]
             value = parts[6]
+            # Only include YouTube domains to avoid Cobalt "unknown service" warnings
+            if "youtube" not in domain and "google" not in domain:
+                continue
             cookies.append({
                 "domain": domain,
                 "hostOnly": not domain.startswith("."),
