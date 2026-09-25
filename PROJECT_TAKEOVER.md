@@ -106,13 +106,17 @@ Full pipeline (needs ffmpeg + network + tokens): `python3 test_pipeline.py`
 | # | Issue | Severity | Status |
 |---|-------|----------|--------|
 | 1 | **Live secrets committed in `CHAT_TRANSFER_SUMMARY.md`** (PAT, Render token, bot token, DB password) | 🔴 CRITICAL | Redacted in tree; **rotation still required** (git history still has them) |
-| 2 | `client_secrets.json` / `token.json` not in `.gitignore` | 🟠 High | ✅ Fixed |
-| 3 | `add_queue_item()` allowed duplicate in-queue URLs (batch paths rejected them) | 🟡 Medium | ✅ Fixed + covered by smoke test |
-| 4 | `queue_manager.py` vs `queue_engine.py` duplication; `/diag` uses legacy module | 🟡 Medium | Open — consolidate on `queue_engine` |
-| 5 | `agents/simple_trend*.py` dead code | 🟢 Low | Open — delete after confirming no CI refs |
-| 6 | `/diag` reads `viral_trends`, importers write `trends` → count mismatch (from QA report) | 🟡 Medium | Open — unify table |
+| 2 | `client_secrets.json` / `token.json` not in `.gitignore` | 🟠 High | ✅ Fixed (takeover) |
+| 3 | `add_queue_item()` allowed duplicate in-queue URLs (batch paths rejected them) | 🟡 Medium | ✅ Fixed + smoke-tested (takeover) |
+| 4 | `queue_manager.py` vs `queue_engine.py` duplication; `/diag` used legacy module | 🟡 Medium | ✅ Fixed (stabilize): `/diag` → `queue_engine`, legacy module is now a deprecated shim |
+| 5 | `agents/simple_trend*.py` dead code | 🟢 Low | ✅ Fixed (stabilize): deleted, zero refs |
+| 6 | `/diag` read only `viral_trends`, importers write `trends` → count mismatch (from QA report) | 🟡 Medium | ✅ Fixed (stabilize): `/diag` reports **both** tables (`trends` + `trends_imported`) |
 | 7 | `DATABASE_URL` read at import time (hard to reconfigure in tests/long-running) | 🟢 Low | Open |
-| 8 | Live Render reachability unverified this session (sandbox has no egress) | 🟡 Medium | Open — verify `/db_status` from your network |
+| 8 | Live Render reachability unverified this session (sandbox has no egress) | 🟡 Medium | Open — run §10 checklist from your network |
+| 9 | Queue processor imported `generate_seo_metadata` from `viral_trend_engine` (doesn't exist there) → **ImportError on first real queue item** | 🔴 CRITICAL | ✅ Fixed (stabilize): imports from `bot.py`; regression check in smoke test |
+| 10 | Orphaned `return {"outros": ...}` block inside `refresh_report_callback` → **NameError on every 🔄 Refresh click** | 🔴 CRITICAL | ✅ Fixed (stabilize): deleted; refresh shares `_build_daily_report_view()` with `/daily_report` |
+| 11 | Refresh rebuilt message with dead `approve_song` button (no handler registered) + different table than `/daily_report` | 🟡 Medium | ✅ Fixed (stabilize): unified view, per-trend `approve_trend_<id>` buttons |
+| 12 | No CI gate — broken imports/NameErrors reached production undetected | 🟡 Medium | ✅ Fixed (stabilize): `.github/workflows/lint.yml` (`py_compile` + smoke test on every push) |
 
 ---
 

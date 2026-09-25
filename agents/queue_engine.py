@@ -325,7 +325,7 @@ async def run_queue_processor(bot, default_privacy: str, dispatch_fn) -> None:
         dispatch_fn: callable that accepts payload dict and dispatches to GitHub worker
     """
     from agents.outro_manager import select_outro, record_outro_usage
-    from agents.viral_trend_engine import generate_seo_metadata
+    from bot import generate_seo_metadata
     import datetime as dt
 
     print("[QUEUE] Background processor started", flush=True)

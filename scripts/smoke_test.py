@@ -122,6 +122,54 @@ def main() -> int:
     row = db.fetchone("SELECT value FROM system_state WHERE key = ?", ("bulk_awaiting_999",))
     check("system_state session flag", row is not None and row["value"] == "true")
 
+    # ── Stabilization regression checks (source-level, stdlib-only) ──
+    import ast
+
+    engine_src = (ROOT / "agents" / "queue_engine.py").read_text(encoding="utf-8")
+    check(
+        "queue_engine imports SEO metadata from bot.py",
+        "from bot import generate_seo_metadata" in engine_src
+        and "viral_trend_engine import generate_seo_metadata" not in engine_src,
+    )
+
+    bot_src = (ROOT / "telegram_bot.py").read_text(encoding="utf-8")
+    tree = ast.parse(bot_src)
+    fn_names = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    check("_build_daily_report_view helper exists", "_build_daily_report_view" in fn_names)
+    refresh_fn = next(
+        (n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "refresh_report_callback"),
+        None,
+    )
+    refresh_src = ast.get_source_segment(bot_src, refresh_fn) if refresh_fn else ""
+    check(
+        "refresh handler exists and uses shared report view",
+        refresh_fn is not None and "_build_daily_report_view" in refresh_src,
+    )
+    check(
+        "refresh handler has no orphaned return block",
+        refresh_fn is not None and '"outros": outros' not in refresh_src,
+    )
+    check(
+        "no dead approve_song callback button",
+        'callback_data="approve_song"' not in bot_src and "callback_data='approve_song'" not in bot_src,
+    )
+    check(
+        "/diag uses queue_engine (not legacy queue_manager)",
+        "from agents.queue_engine import get_summary, is_paused" in bot_src,
+    )
+
+    # Legacy shim still importable and delegates to queue_engine
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        import agents.queue_manager as qm
+        import agents.queue_engine as qe
+    check(
+        "queue_manager shim delegates to queue_engine",
+        qm.get_summary is qe.get_summary and qm.is_paused is qe.is_paused,
+    )
+
     print()
     if FAILURES:
         print(f"SMOKE TEST FAILED: {len(FAILURES)} check(s): {FAILURES}")

@@ -1,232 +1,51 @@
 #!/usr/bin/env python3
-"""Manual Upload Queue System — Database-backed sequential job processor.
+"""Legacy queue module — compatibility shim over :mod:`agents.queue_engine`.
 
-Tables:
-  upload_queue    — pending/processing/completed/failed/cancelled jobs
-  queue_history   — audit log of queue actions
-  queue_state     — key/value store (paused flag)
+Consolidated during the 2026-09 stabilization pass: both modules operated on
+the same tables, and ``queue_engine`` is now the single implementation (it has
+duplicate protection, transactional batch inserts, and the fixed SEO-metadata
+import used by the background processor).
 
-Background processor:
-  - Runs in bot's asyncio loop
-  - Processes one item at a time
-  - Dispatches to GitHub Actions worker
-  - Resumes automatically after restart
+All public names are re-exported so any lingering import keeps working.
+New code must import from ``agents.queue_engine`` directly.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any
+import warnings
 
-from agents.db import execute, fetchone, fetchall, insert_and_get_id, init_all_tables
+warnings.warn(
+    "agents.queue_manager is deprecated; use agents.queue_engine instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
+from agents.db import init_all_tables as init_queue_tables  # noqa: E402,F401
+from agents.queue_engine import (  # noqa: E402,F401
+    add_multiple_items,
+    add_multiple_items_transactional,
+    add_queue_item,
+    cancel_all_pending,
+    get_next_pending,
+    get_queue,
+    get_summary,
+    is_paused,
+    run_queue_processor,
+    set_paused,
+    update_status,
+)
 
-# ── Database ─────────────────────────────────────────────────────────────────
-
-def init_queue_tables() -> None:
-    """Initialize queue tables via central db abstraction."""
-    init_all_tables()
-
-
-def _log_action(queue_id: int | None, action: str, detail: str = "") -> None:
-    execute(
-        "INSERT INTO queue_history (queue_id, action, detail, created_at) VALUES (?, ?, ?, ?)",
-        (queue_id, action, detail, datetime.now().isoformat()),
-    )
-
-
-# ── Queue CRUD ───────────────────────────────────────────────────────────────
-
-def add_queue_item(user_id: int, chat_id: int, song_name: str, youtube_url: str) -> int:
-    init_queue_tables()
-    item_id = insert_and_get_id(
-        """INSERT INTO upload_queue (user_id, chat_id, song_name, youtube_url, status, created_at)
-           VALUES (?, ?, ?, ?, 'pending', ?)""",
-        (user_id, chat_id, song_name, youtube_url, datetime.now().isoformat()),
-    )
-    _log_action(item_id, "added", f"song={song_name}")
-    return item_id
-
-
-def add_multiple_items(user_id: int, chat_id: int, items: list[dict[str, str]]) -> list[int]:
-    """Add multiple items. Returns list of IDs."""
-    ids = []
-    for item in items:
-        ids.append(add_queue_item(user_id, chat_id, item["song_name"], item["youtube_url"]))
-    return ids
-
-
-def get_queue(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-    init_queue_tables()
-    if status:
-        return fetchall(
-            """SELECT * FROM upload_queue WHERE status = ? ORDER BY id LIMIT ?""",
-            (status, limit),
-        )
-    return fetchall(
-        """SELECT * FROM upload_queue ORDER BY id DESC LIMIT ?""",
-        (limit,)
-    )
-
-
-def get_next_pending() -> dict[str, Any] | None:
-    """Get oldest pending item."""
-    init_queue_tables()
-    return fetchone(
-        """SELECT * FROM upload_queue WHERE status = 'pending' ORDER BY id LIMIT 1"""
-    )
-
-
-def update_status(item_id: int, status: str, video_id: str | None = None, error: str | None = None) -> None:
-    init_queue_tables()
-    completed_at = datetime.now().isoformat() if status in ("completed", "failed", "cancelled") else None
-    execute(
-        """UPDATE upload_queue
-           SET status = ?, video_id = ?, error_message = ?, completed_at = ?
-           WHERE id = ?""",
-        (status, video_id, error, completed_at, item_id),
-    )
-    _log_action(item_id, f"status_{status}", error or "")
-
-
-def cancel_all_pending() -> int:
-    """Cancel all pending items. Returns count cancelled."""
-    init_queue_tables()
-    items = fetchall("""SELECT id FROM upload_queue WHERE status = 'pending'""")
-    now = datetime.now().isoformat()
-    execute(
-        """UPDATE upload_queue SET status = 'cancelled', completed_at = ? WHERE status = 'pending'""",
-        (now,),
-    )
-    for item in items:
-        _log_action(item["id"], "cancelled", "bulk_cancel")
-    return len(items)
-
-
-def get_summary() -> dict[str, int]:
-    """Return counts by status."""
-    init_queue_tables()
-    rows = fetchall("""SELECT status, COUNT(*) as cnt FROM upload_queue GROUP BY status""")
-    counts = {r["status"]: r["cnt"] for r in rows}
-    return {
-        "total": sum(counts.values()),
-        "pending": counts.get("pending", 0),
-        "processing": counts.get("processing", 0),
-        "completed": counts.get("completed", 0),
-        "failed": counts.get("failed", 0),
-        "cancelled": counts.get("cancelled", 0),
-    }
-
-
-# ── Pause / Resume ───────────────────────────────────────────────────────────
-
-def is_paused() -> bool:
-    init_queue_tables()
-    result = fetchone("SELECT value FROM system_state WHERE key = 'paused'")
-    return result is not None and result.get("value") == "true"
-
-
-def set_paused(paused: bool) -> None:
-    init_queue_tables()
-    execute(
-        """INSERT INTO system_state (key, value) VALUES ('paused', ?)
-           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
-        ("true" if paused else "false",),
-    )
-    _log_action(None, "paused" if paused else "resumed", "")
-
-
-# ── Background Processor ─────────────────────────────────────────────────────
-
-import asyncio
-
-async def run_queue_processor(bot, default_privacy: str, dispatch_fn) -> None:
-    """Background coroutine that processes the queue sequentially.
-
-    Args:
-        bot: python-telegram-bot Bot instance for sending messages.
-        default_privacy: privacy status string.
-        dispatch_fn: callable that accepts a payload dict and dispatches to GitHub worker.
-    """
-    from agents.outro_manager import select_outro, record_outro_usage
-    from agents.viral_trend_engine import generate_seo_metadata
-    import datetime as dt
-
-    print("[QUEUE] Background processor started", flush=True)
-
-    while True:
-        if is_paused():
-            await asyncio.sleep(5)
-            continue
-
-        item = get_next_pending()
-        if not item:
-            await asyncio.sleep(5)
-            continue
-
-        # Mark as processing
-        update_status(item["id"], "processing")
-
-        try:
-            # Notify user
-            await bot.send_message(
-                chat_id=item["chat_id"],
-                text=f"🎵 Processing queue item {item['id']}: {item['song_name']}",
-            )
-
-            # Select outro
-            outro = select_outro()
-            if not outro:
-                update_status(item["id"], "failed", error="No outro available")
-                await bot.send_message(
-                    chat_id=item["chat_id"],
-                    text=f"❌ Queue item {item['id']} failed: No outro available. Use /outro_add first.",
-                )
-                await asyncio.sleep(2)
-                continue
-
-            # Build metadata
-            metadata = generate_seo_metadata(item["song_name"], None, item["youtube_url"])
-            stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-            job_id = f"queue-{item['id']}-{stamp}"
-
-            payload = {
-                "job_id": job_id,
-                "chat_id": item["chat_id"],
-                "user_id": item["user_id"],
-                "song_name": item["song_name"],
-                "artist": None,
-                "source_type": "youtube_url",
-                "youtube_url": item["youtube_url"],
-                "privacy": default_privacy,
-                "custom_title": metadata["title"],
-                "custom_description": metadata["description"],
-                "custom_tags": metadata["tags"],
-                "outro_file_id": outro["file_id"],
-                "outro_ext": outro["ext"],
-            }
-
-            # Dispatch to GitHub Actions
-            await asyncio.to_thread(dispatch_fn, payload)
-            record_outro_usage(outro["outro_id"], job_id)
-
-            # Mark completed (GitHub worker handles actual upload)
-            update_status(item["id"], "completed")
-
-            await bot.send_message(
-                chat_id=item["chat_id"],
-                text=f"✅ Queue item {item['id']} dispatched to GitHub Actions.\nSong: {item['song_name']}",
-            )
-
-        except Exception as exc:
-            error_msg = str(exc)[:200]
-            update_status(item["id"], "failed", error=error_msg)
-            try:
-                await bot.send_message(
-                    chat_id=item["chat_id"],
-                    text=f"❌ Queue item {item['id']} failed:\n{error_msg}",
-                )
-            except Exception:
-                pass
-
-        await asyncio.sleep(2)
+__all__ = [
+    "init_queue_tables",
+    "add_queue_item",
+    "add_multiple_items",
+    "add_multiple_items_transactional",
+    "get_queue",
+    "get_next_pending",
+    "update_status",
+    "cancel_all_pending",
+    "get_summary",
+    "is_paused",
+    "set_paused",
+    "run_queue_processor",
+]

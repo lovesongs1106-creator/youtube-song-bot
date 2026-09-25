@@ -1691,13 +1691,25 @@ def _get_commit_hash() -> str:
 
 @flask_app.route("/diag")
 def diag():
-    """Production diagnostic endpoint. Returns trend engine, outro, and queue status."""
+    """Production diagnostic endpoint. Returns trend engine, outro, and queue status.
+
+    Trend tables (two sources, different writers):
+      - `trends`: user-imported via /import_trends + /seed_trends; feeds
+        /daily_report and the approve_trend_<id> workflow.
+      - `viral_trends`: auto-discovery cache written by refresh_trends()
+        (wiped + rewritten on every refresh), feeds /trend_debug.
+    """
     from agents.viral_trend_engine import _yt_dlp_version, get_viral_trends, DB_PATH
     from agents.outro_manager import list_outros, get_last_used_outro_ids
-    from agents.queue_manager import get_summary, is_paused
+    from agents.queue_engine import get_summary, is_paused
+    from agents.db import fetchall
     from pathlib import Path
     db_exists = Path(DB_PATH).exists()
     trends = get_viral_trends(5)
+    imported_trends = fetchall(
+        "SELECT id, song_name, artist, youtube_url, source_platform, opportunity_score "
+        "FROM trends ORDER BY opportunity_score DESC LIMIT 5"
+    )
     outros = list_outros()
     last_used = get_last_used_outro_ids(3)
     queue_summary = get_summary()
@@ -1712,6 +1724,13 @@ def diag():
             {"song": t[0], "artist": t[1], "platform": t[2], "url": t[3],
              "viral": t[4], "growth": t[5], "competition": t[6], "opportunity": t[7]}
             for t in trends
+        ],
+        "trends_imported_count": len(imported_trends),
+        "trends_imported": [
+            {"id": t["id"], "song": t["song_name"], "artist": t["artist"],
+             "url": t["youtube_url"], "platform": t["source_platform"],
+             "opportunity": t["opportunity_score"]}
+            for t in imported_trends
         ],
         "outros": {
             "count": len(outros),
@@ -2395,19 +2414,15 @@ async def trend_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"❌ trend_debug error:\n{exc}")
 
 
-async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await reject_if_unauthorized(update):
-        return
-    if not ENABLE_RECOMMENDATIONS:
-        await update.message.reply_text("Trend recommendations are currently disabled.")
-        return
+def _build_daily_report_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Render the approve-able daily report from the imported `trends` table.
 
-    await update.message.reply_text("📡 Fetching trends... this may take a moment.")
-    
-    # Get trends with IDs for approve buttons
+    Shared by /daily_report and the 🔄 Refresh button so both show the same
+    per-trend Approve buttons (callback_data=approve_trend_<id>).
+    """
     from agents.db import fetchall
     trends = fetchall("SELECT * FROM trends ORDER BY opportunity_score DESC LIMIT 5")
-    
+
     if not trends:
         report_text = (
             "📈 No imported trends available.\n\n"
@@ -2418,31 +2433,42 @@ async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Song Name 1 | https://youtube.com/watch?v=abc\n"
             "Song Name 2 | https://youtube.com/watch?v=def"
         )
-        await update.message.reply_text(report_text)
-        return
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="refresh_report")]]
+        return report_text, InlineKeyboardMarkup(keyboard)
 
     report_lines = ["📈 Today's Best Upload Opportunities\n"]
     keyboard = []
-    
+
     for i, trend in enumerate(trends, 1):
         song = trend["song_name"][:50]
-        artist = trend.get("artist", "Unknown")[:30]
+        artist = (trend.get("artist") or "Unknown")[:30]
         platform = trend.get("source_platform", "Unknown")
         growth = trend.get("growth_score", 0)
         opp = trend.get("opportunity_score", 0)
         trend_id = trend["id"]
-        
+
         report_lines.append(
             f"{i}. {song}\n"
             f"   🎤 {artist} | 📱 {platform}\n"
             f"   📈 Growth: +{growth}% | 🎯 Opp: {opp}\n"
         )
         keyboard.append([InlineKeyboardButton(f"Approve #{i}", callback_data=f"approve_trend_{trend_id}")])
-    
+
     keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_report")])
-    
-    report_text = "\n".join(report_lines)
-    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    return "\n".join(report_lines), InlineKeyboardMarkup(keyboard)
+
+
+async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not ENABLE_RECOMMENDATIONS:
+        await update.message.reply_text("Trend recommendations are currently disabled.")
+        return
+
+    await update.message.reply_text("📡 Fetching trends... this may take a moment.")
+
+    report_text, reply_markup = _build_daily_report_view()
     await update.message.reply_text(report_text, reply_markup=reply_markup)
 
 
@@ -2534,21 +2560,17 @@ async def refresh_report_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("Trend recommendations are currently disabled.")
         return
 
-    report_text = await asyncio.to_thread(generate_daily_report)
-    keyboard = [
-        [InlineKeyboardButton("Approve Song", callback_data="approve_song")],
-        [InlineKeyboardButton("Refresh", callback_data="refresh_report")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # Re-render the same per-trend view as /daily_report (same table, same
+    # approve_trend_<id> buttons). Previously this used a different table and a
+    # dead "approve_song" button, plus an orphaned return block that raised
+    # NameError on every click.
+    report_text, reply_markup = await asyncio.to_thread(_build_daily_report_view)
 
-    await query.edit_message_text(report_text, reply_markup=reply_markup)
-
-
-    return {
-        "outros": outros,
-        "history": history,
-        "trends": trends,
-    }
+    try:
+        await query.edit_message_text(report_text, reply_markup=reply_markup)
+    except Exception as e:
+        if "Message is not modified" not in str(e):
+            raise
 
 
 def run_flask() -> None:
