@@ -39,6 +39,14 @@ YOUTUBE_TOKEN_JSON = os.environ.get("YOUTUBE_TOKEN_JSON", "").strip()
 GOOGLE_CLIENT_SECRETS_JSON = os.environ.get("GOOGLE_CLIENT_SECRETS_JSON", "").strip()
 YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "").strip()
 
+# Second YouTube channel (Facebook automation) — fully isolated from the
+# first-channel OAuth above. Provided via GitHub Actions secrets/variables.
+YOUTUBE_SECOND_CLIENT_ID = os.environ.get("YOUTUBE_SECOND_CLIENT_ID", "").strip()
+YOUTUBE_SECOND_CLIENT_SECRET = os.environ.get("YOUTUBE_SECOND_CLIENT_SECRET", "").strip()
+YOUTUBE_SECOND_REFRESH_TOKEN = os.environ.get("YOUTUBE_SECOND_REFRESH_TOKEN", "").strip()
+YOUTUBE_TARGET_CHANNEL = os.environ.get("YOUTUBE_TARGET_CHANNEL", "second").strip().lower() or "second"
+YOUTUBE_VISIBILITY = os.environ.get("YOUTUBE_VISIBILITY", "private").strip().lower() or "private"
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -145,8 +153,70 @@ def validate_youtube_token_early() -> tuple[bool, str]:
         return False, f"YouTube token validation error: {exc}"
 
 
-def upload_to_youtube(video_file: Path, thumbnail_file: Path, metadata: dict[str, Any], privacy: str) -> str:
-    youtube = get_youtube_service()
+def get_second_channel_service():
+    """Build the YouTube API client for the SECOND channel.
+
+    Auth is a dedicated OAuth client (client_id + client_secret + refresh
+    token from GitHub secrets). Never touches the first channel's
+    YOUTUBE_TOKEN_JSON credentials.
+    """
+    missing = [
+        name for name, val in (
+            ("YOUTUBE_SECOND_CLIENT_ID", YOUTUBE_SECOND_CLIENT_ID),
+            ("YOUTUBE_SECOND_CLIENT_SECRET", YOUTUBE_SECOND_CLIENT_SECRET),
+            ("YOUTUBE_SECOND_REFRESH_TOKEN", YOUTUBE_SECOND_REFRESH_TOKEN),
+        ) if not val
+    ]
+    if missing:
+        raise RuntimeError(
+            "Second-channel YouTube secrets missing in GitHub repo: "
+            + ", ".join(missing) + ".\n\n"
+            "Add them under Settings > Secrets and variables > Actions > Secrets. "
+            "See FACEBOOK_SECOND_CHANNEL_SETUP.md for the one-time OAuth steps."
+        )
+    creds = Credentials(
+        token=None,
+        refresh_token=YOUTUBE_SECOND_REFRESH_TOKEN,
+        client_id=YOUTUBE_SECOND_CLIENT_ID,
+        client_secret=YOUTUBE_SECOND_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=YOUTUBE_UPLOAD_SCOPE,
+    )
+    try:
+        creds.refresh(GoogleRequest())
+    except Exception as refresh_exc:
+        err_str = str(refresh_exc).lower()
+        if "invalid_grant" in err_str:
+            raise RuntimeError(
+                "Second-channel YouTube refresh token EXPIRED/REVOKED (invalid_grant).\n\n"
+                "FIX:\n"
+                "1. Re-run the second-channel OAuth flow (FACEBOOK_SECOND_CHANNEL_SETUP.md)\n"
+                "2. Update the YOUTUBE_SECOND_REFRESH_TOKEN repo secret\n"
+                "3. Re-dispatch the job with /upload_force JOB-ID\n\n"
+                f"Technical detail: {refresh_exc}"
+            )
+        raise RuntimeError(f"Second-channel token refresh failed: {refresh_exc}")
+    return build("youtube", "v3", credentials=creds)
+
+
+def validate_second_channel_early() -> tuple[bool, str]:
+    """Validate second-channel credentials before heavy work. Returns (ok, message)."""
+    try:
+        service = get_second_channel_service()
+        me = service.channels().list(part="snippet", mine=True).execute()
+        items = me.get("items", [])
+        if not items:
+            return False, "Second-channel auth OK but no channel found on this Google account."
+        title = items[0]["snippet"]["title"]
+        return True, f"Second channel verified: '{title}' — upload ready."
+    except RuntimeError as exc:
+        return False, str(exc)
+    except Exception as exc:
+        return False, f"Second-channel validation error: {exc}"
+
+
+def upload_to_youtube(video_file: Path, thumbnail_file: Path, metadata: dict[str, Any], privacy: str, service=None) -> str:
+    youtube = service if service is not None else get_youtube_service()
     body = {
         "snippet": {
             "title": metadata["title"][:100],
@@ -191,8 +261,207 @@ def verify_cookies() -> tuple[bool, str]:
     return False, f"YOUTUBE_COOKIES audit: Secret exists: YES | Cookie file size: {size} bytes | Cookie format: INVALID (first line: {first_line[:60]})"
 
 
+def report_fb_status(payload: dict[str, Any], status: str, stage: str = "",
+                     error: str | None = None, video_id: str | None = None) -> None:
+    """Best-effort status callback to the bot's /fb_job_status endpoint."""
+    url = (payload.get("status_callback_url") or "").strip()
+    if not url:
+        return
+    try:
+        requests.post(url, json={
+            "job_id": payload.get("job_id", ""),
+            "status": status,
+            "stage": stage,
+            "error_message": (error or "")[:500],
+            "youtube_video_id": video_id or "",
+        }, timeout=30)
+    except Exception as exc:
+        log(f"[FB] Status callback failed (non-fatal): {exc}")
+
+
+def cleanup_job_dir(job_dir: Path) -> None:
+    import shutil
+    try:
+        if job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
+            log(f"[FB] Cleaned temp dir: {job_dir}")
+    except Exception as exc:
+        log(f"[FB] Temp cleanup warning: {exc}")
+
+
+def run_second_channel_check(payload: dict[str, Any]) -> None:
+    """Validate second-channel secrets end-to-end and report to Telegram."""
+    from facebook_pipeline import resolve_outro_asset
+    chat_id = payload["chat_id"]
+    job_id = payload.get("job_id", "second-channel-check")
+    send_message(chat_id, f"🔍 Second-channel check started.\nJob: {job_id}")
+
+    log("=== Second Channel Check ===")
+    ok, msg = validate_second_channel_early()
+    log(f"[SECOND_CHECK] {msg}")
+
+    outro = resolve_outro_asset()
+    outro_msg = f"✅ Outro asset found: {outro}" if outro.exists() else (
+        f"❌ Outro asset MISSING: {outro}\n"
+        "Add assets/outro.mp4 to the repo (or set OUTRO_ASSET_PATH)."
+    )
+    log(f"[SECOND_CHECK] {outro_msg}")
+
+    if ok and outro.exists():
+        send_message(
+            chat_id,
+            "✅ Second channel check PASSED\n\n"
+            f"{msg}\n"
+            f"{outro_msg}\n\n"
+            f"Target: {YOUTUBE_TARGET_CHANNEL} | Visibility: {YOUTUBE_VISIBILITY}\n"
+            "Facebook jobs (/upload) are ready to run."
+        )
+    else:
+        send_message(
+            chat_id,
+            "❌ Second channel check FAILED\n\n"
+            f"{msg}\n"
+            f"{outro_msg}\n\n"
+            "Fix the items above, then run /second_channel_check again."
+        )
+        raise RuntimeError(f"Second-channel check failed: {msg} | {outro_msg}")
+
+
+def run_facebook_job(payload: dict[str, Any]) -> None:
+    """Full Facebook -> second-channel pipeline for one job."""
+    from facebook_pipeline import (
+        build_facebook_metadata,
+        download_facebook_video,
+        extract_frame,
+        get_facebook_title,
+        process_facebook_video,
+        resolve_outro_asset,
+        trim_video,
+    )
+    from bot import generate_reference_thumbnail, generate_thumbnail
+
+    chat_id = payload["chat_id"]
+    job_id = payload.get("job_id", str(int(time.time())))
+    fb_url = payload.get("facebook_url", "")
+    trim_start = payload.get("trim_start")
+    trim_end = payload.get("trim_end")
+    privacy = (payload.get("privacy") or YOUTUBE_VISIBILITY or "private").lower()
+    if privacy not in ("private", "unlisted", "public"):
+        privacy = "private"
+
+    send_message(chat_id, f"🚀 Facebook worker started.\nJob: {job_id}\nPrivacy: {privacy}")
+
+    log("=== Facebook Worker Environment Audit ===")
+    log(f"yt-dlp version: {os.popen('yt-dlp --version').read().strip()}")
+    log(f"python version: {sys.version.split()[0]}")
+    log(f"ffmpeg version: {os.popen('ffmpeg -version').read().splitlines()[0]}")
+    log(f"target_channel: {YOUTUBE_TARGET_CHANNEL} | visibility: {privacy}")
+    log("=========================================")
+
+    # EARLY second-channel validation — fail fast before heavy work.
+    token_ok, token_msg = validate_second_channel_early()
+    log(f"[FB_TOKEN_CHECK] {token_msg}")
+    report_fb_status(payload, "dispatched", "token_check")
+    if not token_ok:
+        report_fb_status(payload, "failed", "token_check", error=token_msg)
+        send_message(chat_id, f"❌ Second-channel auth INVALID.\n\n{token_msg}\n\nJob aborted early.")
+        raise RuntimeError(token_msg)
+    send_message(chat_id, f"🔑 {token_msg}")
+
+    job_dir = JOB_DIR / job_id
+    try:
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        outro_asset = resolve_outro_asset()
+        if not outro_asset.exists():
+            raise RuntimeError(
+                f"Outro asset missing: {outro_asset}. "
+                "Add assets/outro.mp4 to the repo (or set OUTRO_ASSET_PATH)."
+            )
+
+        # Title first (cheap metadata read, no download).
+        send_message(chat_id, "🔎 Facebook video info read kar raha hoon...")
+        report_fb_status(payload, "downloading", "probing")
+        video_title = get_facebook_title(fb_url) or "Facebook Video"
+        send_message(chat_id, f"🎬 Title: {video_title}")
+
+        # Download (public/accessible content only — enforced in pipeline).
+        send_message(chat_id, "⬇️ Facebook video download kar raha hoon...")
+        try:
+            source_video = download_facebook_video(fb_url, job_dir / "downloaded")
+        except Exception as exc:
+            report_fb_status(payload, "failed", "download", error=str(exc))
+            send_message(chat_id, f"❌ Facebook download fail ho gaya.\n\n{exc}")
+            raise
+
+        # Optional exact trim.
+        main_video = source_video
+        if trim_start is not None and trim_end is not None:
+            send_message(chat_id, f"✂️ Exact trim kar raha hoon: {trim_start:.0f}s-{trim_end:.0f}s...")
+            report_fb_status(payload, "processing", "trim")
+            main_video = trim_video(source_video, job_dir / "trimmed.mp4", trim_start, trim_end)
+
+        # Normalize + append fixed outro.
+        send_message(chat_id, "🎬 FFmpeg processing + outro append kar raha hoon...")
+        report_fb_status(payload, "processing", "render")
+        final_video = process_facebook_video(
+            main_video, outro_asset, job_dir / "final_video.mp4", job_dir / "work"
+        )
+
+        # Thumbnail from a real video frame (existing reference-thumbnail style).
+        thumb_path = job_dir / "thumbnail.jpg"
+        try:
+            frame = extract_frame(final_video, job_dir / "frame.jpg")
+            generate_reference_thumbnail(video_title, None, frame, thumb_path)
+        except Exception as exc:
+            log(f"[FB] Frame thumbnail failed ({exc}) — using generated title card.")
+            generate_thumbnail(video_title, None, thumb_path)
+
+        # Metadata + upload to SECOND channel only.
+        metadata = build_facebook_metadata(video_title, fb_url)
+        send_message(
+            chat_id,
+            "✅ Metadata ready\n\n"
+            f"Title: {metadata['title']}\n"
+            f"Privacy: {privacy} (second channel)\n"
+            "📤 YouTube upload start kar raha hoon...",
+        )
+        report_fb_status(payload, "uploading", "youtube_upload")
+        service = get_second_channel_service()
+        video_id = upload_to_youtube(final_video, thumb_path, metadata, privacy, service=service)
+
+        report_fb_status(payload, "completed", "done", video_id=video_id)
+        send_message(
+            chat_id,
+            f"✅ Done bhai! Second channel par upload ho gaya:\n"
+            f"https://www.youtube.com/watch?v={video_id}\nJob: {job_id}"
+        )
+    except Exception as exc:
+        log(f"[FB] ERROR: {exc}")
+        report_fb_status(payload, "failed", "error", error=str(exc))
+        try:
+            send_message(chat_id, f"❌ Facebook job {job_id} failed:\n{exc}")
+        except Exception:
+            pass
+        raise
+    finally:
+        cleanup_job_dir(job_dir)
+
+
 def main() -> None:
     payload = read_payload()
+
+    # Facebook -> second-channel path. Fully isolated: separate OAuth, separate
+    # payload branch. First-channel flow below is unchanged.
+    if (payload.get("mode") == "second_channel_check"
+            or payload.get("target_channel") == "second"
+            or payload.get("source_type") == "facebook_url"):
+        if payload.get("mode") == "second_channel_check":
+            run_second_channel_check(payload)
+        else:
+            run_facebook_job(payload)
+        return
+
     chat_id = payload["chat_id"]
     job_id = payload.get("job_id", str(int(time.time())))
     song_name = payload["song_name"]

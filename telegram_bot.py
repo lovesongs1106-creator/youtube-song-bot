@@ -67,7 +67,10 @@ from feature_flags import (
     ENABLE_OUTRO_ROTATION_V2,
     ENABLE_DASHBOARD,
     ENABLE_SYSTEM_HEALTH,
+    ENABLE_FACEBOOK_SECOND_CHANNEL,
 )
+
+from agents import fb_jobs as fb_job_manager
 
 from agents.viral_trend_engine import generate_daily_report, trend_debug_info, collect_and_save_trends, get_real_trends
 from agents.outro_manager import (
@@ -375,7 +378,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/github_test - GitHub connection check\n"
         "/export_youtube_token - Token export karo\n"
         "/id - Apna Telegram user ID dekho\n"
-        "/cancel - Current process cancel"
+        "/cancel - Current process cancel\n"
+        "\n"
+        "Facebook (second channel):\n"
+        "/upload - FB video second channel par bhejo\n"
+        "/upload_force - Retry / duplicate bypass\n"
+        "/status - FB job status dekho\n"
+        "/second_channel_check - Setup verify karo"
     )
 
 
@@ -2390,6 +2399,11 @@ async def receive_retry_audio(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # /cancel JOB-ID cancels a Facebook job; bare /cancel keeps the original
+    # conversation-cancel behavior (existing functionality unchanged).
+    if context.args and ENABLE_FACEBOOK_SECOND_CHANNEL:
+        await fb_cancel_cmd(update, context)
+        return ConversationHandler.END
     context.user_data.clear()
     if update.message:
         await update.message.reply_text("Cancelled.")
@@ -2669,6 +2683,275 @@ async def run_auto_mode_scheduler(bot) -> None:
         await asyncio.sleep(600) # Check every 10 mins
 
 
+# ==================== FACEBOOK -> SECOND YOUTUBE CHANNEL ====================
+# Isolated automation: separate OAuth (GitHub secrets), separate job table
+# (fb_jobs), separate worker branch. First-channel /new flow untouched.
+
+FB_UPLOAD_HELP = (
+    "📘 Facebook → Second YouTube Channel\n\n"
+    "Usage:\n"
+    "/upload <FACEBOOK_URL>\n"
+    "/upload <FACEBOOK_URL> trim 02:15-38:42\n\n"
+    "• Only videos accessible WITHOUT login are processed —\n"
+    "  private / login-gated / DRM content is refused, never bypassed.\n"
+    "• Fixed outro assets/outro.mp4 is appended automatically.\n"
+    "• Uploads to the SECOND channel as private.\n"
+    "• Only use videos you own, licensed, or permitted to re-upload.\n\n"
+    "Other commands:\n"
+    "/upload_force <URL or JOB-ID> — retry / bypass duplicate check\n"
+    "/status JOB-ID — job status\n"
+    "/cancel JOB-ID — cancel job\n"
+    "/second_channel_check — verify second-channel setup"
+)
+
+
+async def _fb_requirements_ok(update: Update) -> bool:
+    """Check flag + auth + worker mode. Replies with guidance on failure."""
+    if not ENABLE_FACEBOOK_SECOND_CHANNEL:
+        if update.message:
+            await update.message.reply_text("Facebook upload is currently disabled.")
+        return False
+    if await reject_if_unauthorized(update):
+        return False
+    if not update.message:
+        return False
+    if not USE_GITHUB_WORKER:
+        await update.message.reply_text(
+            "Facebook jobs need the GitHub Actions worker.\n"
+            "Set USE_GITHUB_WORKER=true in Render env and redeploy."
+        )
+        return False
+    return True
+
+
+def _dispatch_fb_job(job: dict) -> None:
+    """Dispatch an fb_jobs row to the GitHub worker (second-channel branch)."""
+    payload = {
+        "job_id": job["job_id"],
+        "song_name": f"FB {job['job_id']}",
+        "chat_id": job["chat_id"],
+        "user_id": job["user_id"],
+        "target_channel": "second",
+        "source_type": "facebook_url",
+        "facebook_url": job["facebook_url"],
+        "trim_start": job["trim_start"],
+        "trim_end": job["trim_end"],
+        "privacy": "private",
+        "status_callback_url": f"{BASE_URL}/fb_job_status" if BASE_URL else "",
+    }
+    dispatch_github_worker(payload)
+    fb_job_manager.set_status(job["job_id"], "dispatched", stage="queued_on_github")
+
+
+async def upload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/upload <FACEBOOK_URL> [trim START-END] — queue a Facebook job."""
+    if not await _fb_requirements_ok(update):
+        return
+    text = update.message.text or ""
+    # Strip the command itself so parsing only sees arguments.
+    arg_text = re.sub(r"^/upload(_force)?(@\w+)?\s*", "", text).strip()
+    if not arg_text:
+        await update.message.reply_text(FB_UPLOAD_HELP)
+        return
+
+    fb_url = fb_job_manager.extract_facebook_url(arg_text)
+    if not fb_url:
+        await update.message.reply_text(
+            "❌ No Facebook URL found.\n\n" + FB_UPLOAD_HELP
+        )
+        return
+    try:
+        trim = fb_job_manager.parse_trim_spec(arg_text)
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    try:
+        result = await asyncio.to_thread(
+            fb_job_manager.create_job, user_id, chat_id, fb_url, trim, False
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Job create failed:\n{exc}")
+        return
+
+    if "duplicate" in result:
+        dup = result["duplicate"]
+        await update.message.reply_text(
+            "🔄 Duplicate — this video already has a job:\n\n"
+            f"{fb_job_manager.format_job_status(dup)}\n\n"
+            "Use /upload_force with the URL to run it again anyway,\n"
+            "or /status JOB-ID to track the existing job."
+        )
+        return
+
+    job = result["job"]
+    trim_note = ""
+    if trim:
+        trim_note = (
+            f"\n✂️ Trim: {fb_job_manager.format_timestamp(trim[0])}-"
+            f"{fb_job_manager.format_timestamp(trim[1])}"
+        )
+    await update.message.reply_text(
+        f"📥 Facebook job queued: {job['job_id']}{trim_note}\n"
+        "🚀 Dispatching to GitHub Actions worker..."
+    )
+    try:
+        await asyncio.to_thread(_dispatch_fb_job, job)
+    except Exception as exc:
+        await asyncio.to_thread(
+            fb_job_manager.set_status, job["job_id"], "failed",
+            "dispatch_error", str(exc)[:300], None,
+        )
+        await update.message.reply_text(
+            f"❌ GitHub dispatch failed:\n{exc}\n\n"
+            f"Retry with: /upload_force {job['job_id']}"
+        )
+        return
+    await update.message.reply_text(
+        f"✅ Job {job['job_id']} dispatched.\n"
+        f"Track it: /status {job['job_id']}"
+    )
+
+
+async def upload_force_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/upload_force <URL [trim ...]> — bypass duplicate check.
+    /upload_force JOB-ID — retry a failed/cancelled job."""
+    if not await _fb_requirements_ok(update):
+        return
+    text = update.message.text or ""
+    arg_text = re.sub(r"^/upload_force(@\w+)?\s*", "", text).strip()
+    if not arg_text:
+        await update.message.reply_text(
+            "Usage:\n/upload_force <FACEBOOK_URL> [trim START-END]\n/upload_force JOB-ID"
+        )
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # JOB-ID retry form (no URL present).
+    if not fb_job_manager.extract_facebook_url(arg_text):
+        job_id = arg_text.split()[0]
+        result = await asyncio.to_thread(fb_job_manager.retry_job, job_id)
+        if "error" in result:
+            await update.message.reply_text(f"❌ {result['error']}")
+            return
+        job = result["job"]
+        await update.message.reply_text(
+            f"🔁 Retrying job {job['job_id']} "
+            f"(attempt {job['attempts']}/{job['max_attempts']})..."
+        )
+        try:
+            await asyncio.to_thread(_dispatch_fb_job, job)
+        except Exception as exc:
+            await asyncio.to_thread(
+                fb_job_manager.set_status, job["job_id"], "failed",
+                "dispatch_error", str(exc)[:300], None,
+            )
+            await update.message.reply_text(f"❌ Dispatch failed:\n{exc}")
+            return
+        await update.message.reply_text(f"✅ Job {job['job_id']} re-dispatched.")
+        return
+
+    # Force-new form (bypasses duplicate protection).
+    fb_url = fb_job_manager.extract_facebook_url(arg_text)
+    try:
+        trim = fb_job_manager.parse_trim_spec(arg_text)
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return
+    try:
+        result = await asyncio.to_thread(
+            fb_job_manager.create_job, user_id, chat_id, fb_url, trim, True
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Job create failed:\n{exc}")
+        return
+    job = result["job"]
+    await update.message.reply_text(
+        f"📥 Force job queued: {job['job_id']}\n🚀 Dispatching..."
+    )
+    try:
+        await asyncio.to_thread(_dispatch_fb_job, job)
+    except Exception as exc:
+        await asyncio.to_thread(
+            fb_job_manager.set_status, job["job_id"], "failed",
+            "dispatch_error", str(exc)[:300], None,
+        )
+        await update.message.reply_text(f"❌ Dispatch failed:\n{exc}")
+        return
+    await update.message.reply_text(f"✅ Job {job['job_id']} dispatched.")
+
+
+async def fb_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status JOB-ID — show a Facebook job's status."""
+    if not await _fb_requirements_ok(update):
+        return
+    if not context.args:
+        recent = await asyncio.to_thread(fb_job_manager.list_recent_jobs, 5)
+        if not recent:
+            await update.message.reply_text("No Facebook jobs yet. Use /upload <URL>.")
+            return
+        lines = ["📘 Recent Facebook jobs:\n"]
+        for j in recent:
+            icon = fb_job_manager.STATUS_ICONS.get(j["status"], "❓")
+            lines.append(f"{icon} {j['job_id']} — {j['status']}")
+        lines.append("\nDetails: /status JOB-ID")
+        await update.message.reply_text("\n".join(lines))
+        return
+    job = await asyncio.to_thread(fb_job_manager.get_job, context.args[0])
+    if not job:
+        await update.message.reply_text(f"❌ Job {context.args[0]} not found.")
+        return
+    await update.message.reply_text(fb_job_manager.format_job_status(job))
+
+
+async def fb_cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel JOB-ID — cancel a Facebook job (queued or dispatched)."""
+    if not await _fb_requirements_ok(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /cancel JOB-ID")
+        return
+    result = await asyncio.to_thread(fb_job_manager.cancel_job, context.args[0])
+    if "error" in result:
+        await update.message.reply_text(f"❌ {result['error']}")
+        return
+    await update.message.reply_text(
+        f"{fb_job_manager.format_job_status(result['job'])}\n\n{result['note']}"
+    )
+
+
+async def second_channel_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/second_channel_check — verify second-channel OAuth + outro asset via worker."""
+    if not await _fb_requirements_ok(update):
+        return
+    if not BASE_URL:
+        await update.message.reply_text("BASE_URL missing — cannot build worker callbacks.")
+        return
+    job_id = f"fb-check-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    payload = {
+        "job_id": job_id,
+        "song_name": "Second channel check",
+        "chat_id": update.effective_chat.id,
+        "user_id": update.effective_user.id,
+        "mode": "second_channel_check",
+        "target_channel": "second",
+    }
+    await update.message.reply_text(
+        "🔍 Dispatching second-channel check to GitHub Actions...\n"
+        f"Job: {job_id}\n\n"
+        "The worker will verify YOUTUBE_SECOND_* secrets, confirm the "
+        "channel identity, and check assets/outro.mp4 — result ayega yahin."
+    )
+    try:
+        await asyncio.to_thread(dispatch_github_worker, payload)
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Dispatch failed:\n{exc}")
+
+
 def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -2689,6 +2972,14 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("worker_status", worker_status))
     app.add_handler(CommandHandler("bulk_upload", bulk_upload))
     app.add_handler(CommandHandler("import_trends", import_trends))
+
+    # Facebook -> second YouTube channel (isolated feature; /cancel JOB-ID is
+    # handled by the extended cancel handler registered below).
+    if ENABLE_FACEBOOK_SECOND_CHANNEL:
+        app.add_handler(CommandHandler("upload", upload_cmd))
+        app.add_handler(CommandHandler("upload_force", upload_force_cmd))
+        app.add_handler(CommandHandler("status", fb_status_cmd))
+        app.add_handler(CommandHandler("second_channel_check", second_channel_check_cmd))
 
     # Outro add conversation (polling mode)
     outro_conv = ConversationHandler(
@@ -2992,6 +3283,41 @@ def github_status():
             except Exception as e:
                 print(f"[GITHUB_STATUS] Notify failed: {e}", flush=True)
 
+        return {"status": "ok", "job_id": job_id}
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
+
+@flask_app.route("/fb_job_status", methods=["POST"])
+def fb_job_status():
+    """Callback endpoint for the GitHub worker to report Facebook job progress.
+
+    Expected JSON body:
+    {
+        "job_id": "fb-...",
+        "status": "dispatched|downloading|processing|uploading|completed|failed",
+        "stage": "free-text stage",
+        "error_message": "optional error text",
+        "youtube_video_id": "optional id on completion"
+    }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        job_id = (data.get("job_id") or "").strip()
+        status = (data.get("status") or "").strip()
+        if not job_id or not status:
+            return {"error": "job_id and status required"}, 400
+        if status not in ("queued", "dispatched", "downloading", "processing",
+                          "uploading", "completed", "failed", "cancelled"):
+            return {"error": f"unknown status '{status}'"}, 400
+        fb_job_manager.set_status(
+            job_id, status,
+            stage=(data.get("stage") or "")[:120],
+            error=(data.get("error_message") or "")[:500] or None,
+            youtube_video_id=(data.get("youtube_video_id") or "")[:32] or None,
+        )
+        print(f"[FB_STATUS] {job_id} -> {status} ({data.get('stage', '')})", flush=True)
         return {"status": "ok", "job_id": job_id}
     except Exception as exc:
         import traceback

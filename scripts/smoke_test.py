@@ -170,6 +170,151 @@ def main() -> int:
         qm.get_summary is qe.get_summary and qm.is_paused is qe.is_paused,
     )
 
+    # ── Facebook job manager ──
+    from agents import fb_jobs
+
+    fb_urls = [
+        "https://www.facebook.com/watch?v=123456789",
+        "https://fb.watch/abcXYZ123/",
+        "https://www.facebook.com/SomePage/videos/987654321",
+        "https://www.facebook.com/reel/555666777?__cft__=x&fbclid=y",
+    ]
+    check(
+        "extract_facebook_url finds FB links",
+        all(fb_jobs.extract_facebook_url(u) for u in fb_urls),
+    )
+    check(
+        "extract_facebook_url rejects non-FB links",
+        fb_jobs.extract_facebook_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ") is None,
+    )
+    check(
+        "normalize strips tracking params",
+        fb_jobs.normalize_facebook_url(fb_urls[3])
+        == "https://www.facebook.com/reel/555666777",
+    )
+
+    trim = fb_jobs.parse_trim_spec(f"/upload {fb_urls[0]} trim 02:15-38:42")
+    check("parse_trim_spec MM:SS range", trim == (135.0, 2322.0), str(trim))
+    trim_h = fb_jobs.parse_trim_spec("trim 1:02:03-2:00:00")
+    check("parse_trim_spec HH:MM:SS range", trim_h == (3723.0, 7200.0), str(trim_h))
+    check("parse_trim_spec absent -> None", fb_jobs.parse_trim_spec(fb_urls[0]) is None)
+    for bad in ("trim 38:42-02:15", "trim abc", "trim 01:00"):
+        try:
+            fb_jobs.parse_trim_spec(bad)
+            check(f"parse_trim_spec rejects '{bad}'", False)
+        except ValueError:
+            check(f"parse_trim_spec rejects '{bad}'", True)
+
+    r1 = fb_jobs.create_job(111, 222, fb_urls[0], trim)
+    check("fb create_job queued", "job" in r1 and r1["job"]["status"] == "queued")
+    job_a = r1["job"]["job_id"]
+    check("fb job_id format", job_a.startswith("fb-"), job_a)
+
+    dup = fb_jobs.create_job(111, 222, fb_urls[0])
+    check("fb duplicate URL blocked", "duplicate" in dup)
+
+    rf = fb_jobs.create_job(111, 222, fb_urls[0], None, True)
+    check("fb force bypasses duplicate", "job" in rf)
+    job_b = rf["job"]["job_id"]
+
+    fb_jobs.set_status(job_a, "completed", "done", youtube_video_id="vidABC")
+    still_dup = fb_jobs.create_job(111, 222, fb_urls[0])
+    check("fb completed URL still protected", "duplicate" in still_dup)
+
+    c = fb_jobs.cancel_job(job_b)
+    check("fb cancel queued job", "job" in c and c["job"]["status"] == "cancelled")
+
+    rt = fb_jobs.retry_job(job_b)
+    check("fb retry cancelled job", "job" in rt and rt["job"]["attempts"] == 2)
+    fb_jobs.set_status(job_b, "dispatched", "queued_on_github")
+    cd = fb_jobs.cancel_job(job_b)
+    check(
+        "fb cancel dispatched job flags request",
+        "job" in cd and cd["job"]["cancel_requested"] == 1,
+    )
+    fb_jobs.set_status(job_b, "failed", "error", error="boom")
+    rt2 = fb_jobs.retry_job(job_b)
+    check("fb retry failed job", "job" in rt2 and rt2["job"]["attempts"] == 3)
+    rt3 = fb_jobs.retry_job(job_b)
+    check("fb retry respects max attempts", "error" in rt3)
+
+    done_job = fb_jobs.get_job(job_a)
+    text = fb_jobs.format_job_status(done_job)
+    check("fb format_job_status", job_a in text and "vidABC" in text)
+
+    # ── Facebook wiring (source-level: worker/bot need heavy deps) ──
+    import ast as _ast
+
+    gw_src = (ROOT / "github_worker.py").read_text(encoding="utf-8")
+    gw_tree = _ast.parse(gw_src)
+    gw_fns = {n.name for n in _ast.walk(gw_tree)
+              if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))}
+    for fn in ("run_facebook_job", "run_second_channel_check",
+               "get_second_channel_service", "validate_second_channel_early",
+               "report_fb_status", "cleanup_job_dir"):
+        check(f"github_worker has {fn}", fn in gw_fns)
+    check(
+        "worker branches on second-channel payload",
+        'target_channel") == "second"' in gw_src and 'facebook_url"' in gw_src,
+    )
+    check(
+        "upload_to_youtube keeps default first-channel behavior",
+        "service=None" in gw_src and "service if service is not None else get_youtube_service()" in gw_src,
+    )
+    check(
+        "worker never mixes channel credentials",
+        "YOUTUBE_TOKEN_JSON" in gw_src and "YOUTUBE_SECOND_REFRESH_TOKEN" in gw_src,
+    )
+
+    tb_src = (ROOT / "telegram_bot.py").read_text(encoding="utf-8")
+    tb_tree = _ast.parse(tb_src)
+    tb_fns = {n.name for n in _ast.walk(tb_tree)
+              if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))}
+    for fn in ("upload_cmd", "upload_force_cmd", "fb_status_cmd",
+               "fb_cancel_cmd", "second_channel_check_cmd"):
+        check(f"telegram_bot has {fn}", fn in tb_fns)
+    check("telegram_bot has /fb_job_status route", '"/fb_job_status"' in tb_src)
+    for cmd in ('CommandHandler("upload"', 'CommandHandler("upload_force"',
+                'CommandHandler("status"', 'CommandHandler("second_channel_check"'):
+        check(f"telegram_bot registers {cmd[15:-1]}", cmd in tb_src)
+
+    import feature_flags
+
+    check("ENABLE_FACEBOOK_SECOND_CHANNEL on",
+          getattr(feature_flags, "ENABLE_FACEBOOK_SECOND_CHANNEL", False) is True)
+
+    # Access-policy compliance: pipeline must not contain auth bypasses.
+    # (Scan code string literals, not comments/docstrings that document the ban.)
+    fp_src = (ROOT / "facebook_pipeline.py").read_text(encoding="utf-8")
+    fp_tree = _ast.parse(fp_src)
+    fp_strings = [
+        n.value for n in _ast.walk(fp_tree)
+        if isinstance(n, _ast.Constant) and isinstance(n.value, str)
+    ]
+    check(
+        "fb pipeline passes no cookies/credentials",
+        not any(s in ("--cookies", "--username", "--password",
+                      "--cookiefile", "--netrc")
+                for s in fp_strings),
+    )
+    check(
+        "fb pipeline refuses gated content",
+        "ACCESS_DENIED_MARKERS" in fp_src and "login required" in fp_src,
+    )
+    check(
+        "fb pipeline honors OUTRO_ASSET_PATH",
+        'OUTRO_ASSET_PATH' in fp_src and 'assets/outro.mp4' in fp_src,
+    )
+
+    wf_src = (ROOT / ".github" / "workflows" / "render-upload.yml").read_text(encoding="utf-8")
+    for ref in ("secrets.YOUTUBE_SECOND_CLIENT_ID",
+                "secrets.YOUTUBE_SECOND_CLIENT_SECRET",
+                "secrets.YOUTUBE_SECOND_REFRESH_TOKEN",
+                "vars.YOUTUBE_TARGET_CHANNEL",
+                "vars.YOUTUBE_VISIBILITY",
+                "vars.OUTRO_ASSET_PATH"):
+        check(f"workflow references {ref}", ref in wf_src)
+
     print()
     if FAILURES:
         print(f"SMOKE TEST FAILED: {len(FAILURES)} check(s): {FAILURES}")

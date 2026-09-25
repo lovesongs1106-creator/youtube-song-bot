@@ -248,6 +248,27 @@ def _pg_ddl(table_name: str) -> str:
                 updated_at TEXT NOT NULL
             )
         """,
+        "fb_jobs": """
+            CREATE TABLE IF NOT EXISTS fb_jobs (
+                id SERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                facebook_url TEXT NOT NULL,
+                normalized_url TEXT NOT NULL,
+                trim_start REAL,
+                trim_end REAL,
+                status TEXT DEFAULT 'queued',
+                stage TEXT DEFAULT '',
+                attempts INTEGER DEFAULT 1,
+                max_attempts INTEGER DEFAULT 3,
+                error_message TEXT,
+                youtube_video_id TEXT,
+                cancel_requested INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
     }
     return ddls.get(table_name, "")
 
@@ -367,6 +388,27 @@ def _sqlite_ddl(table_name: str) -> str:
                 updated_at TEXT NOT NULL
             )
         """,
+        "fb_jobs": """
+            CREATE TABLE IF NOT EXISTS fb_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                facebook_url TEXT NOT NULL,
+                normalized_url TEXT NOT NULL,
+                trim_start REAL,
+                trim_end REAL,
+                status TEXT DEFAULT 'queued',
+                stage TEXT DEFAULT '',
+                attempts INTEGER DEFAULT 1,
+                max_attempts INTEGER DEFAULT 3,
+                error_message TEXT,
+                youtube_video_id TEXT,
+                cancel_requested INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
     }
     return ddls.get(table_name, "")
 
@@ -380,6 +422,7 @@ def init_all_tables() -> None:
             "trends", "upload_queue", "uploads", "outros",
             "outro_history", "queue_history", "system_state",
             "auto_mode_config", "viral_trends", "github_jobs",
+            "fb_jobs",
         ]
         # Use actual connection type, not is_using_postgres()
         using_pg = not isinstance(conn, sqlite3.Connection)
@@ -412,6 +455,8 @@ def init_all_tables() -> None:
             "CREATE INDEX IF NOT EXISTS idx_uploads_url ON uploads(youtube_url)",
             "CREATE INDEX IF NOT EXISTS idx_outros_active ON outros(is_active)",
             "CREATE INDEX IF NOT EXISTS idx_outro_history_time ON outro_history(used_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_fb_jobs_url ON fb_jobs(normalized_url)",
+            "CREATE INDEX IF NOT EXISTS idx_fb_jobs_status ON fb_jobs(status)",
         ]
         for sql in index_sql:
             c.execute(sql)

@@ -152,6 +152,28 @@ Suggested default: **A first** (1 session), then B/C.
 
 ---
 
+## 9. Facebook → second-channel automation (added 2026-09-25)
+
+Isolated feature behind `ENABLE_FACEBOOK_SECOND_CHANNEL`. First-channel
+`/new` flow and OAuth untouched.
+
+- **Bot:** `/upload <FB_URL> [trim START-END]`, `/upload_force <URL|JOB-ID>`,
+  `/status [JOB-ID]`, `/cancel JOB-ID` (bare `/cancel` unchanged),
+  `/second_channel_check`, plus `/fb_job_status` worker-callback endpoint.
+- **Jobs:** `agents/fb_jobs.py` + `fb_jobs` table — IDs (`fb-…`), duplicate
+  URL protection (active + completed), 3-attempt retries, cancel semantics.
+- **Worker:** `github_worker.py` branches on `target_channel=second` /
+  `source_type=facebook_url`; separate OAuth via `YOUTUBE_SECOND_*` secrets;
+  `facebook_pipeline.py` downloads (public-only, no cookies/credentials —
+  login/DRM refused), trims exactly, appends `assets/outro.mp4`, uploads
+  private; temp dirs cleaned in `finally`.
+- **Workflow:** `render-upload.yml` gains 3 secrets + 3 vars
+  (`YOUTUBE_TARGET_CHANNEL`, `YOUTUBE_VISIBILITY`, `OUTRO_ASSET_PATH`) and a
+  non-blocking audit step. `lint.yml` also runs `scripts/validate_workflow.py`.
+- **Setup:** `FACEBOOK_SECOND_CHANNEL_SETUP.md`. Manual steps: second-channel
+  OAuth refresh token, 3 repo secrets, 3 repo vars, `assets/outro.mp4` file.
+- **Validation:** `py_compile` clean, smoke test 74/74, workflow validator green.
+
 ## 9. Session conventions (from repo history)
 
 - Hindi-English mix is fine; user wants **raw evidence** (logs, rows, statuses),

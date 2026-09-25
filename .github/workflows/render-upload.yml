@@ -19,6 +19,13 @@ jobs:
       VIDEO_HEIGHT: ${{ vars.VIDEO_HEIGHT || '1080' }}
       VIDEO_FPS: ${{ vars.VIDEO_FPS || '30' }}
       FFMPEG_PRESET: ${{ vars.FFMPEG_PRESET || 'veryfast' }}
+      # Facebook -> second YouTube channel config (isolated from first channel).
+      YOUTUBE_SECOND_CLIENT_ID: ${{ secrets.YOUTUBE_SECOND_CLIENT_ID }}
+      YOUTUBE_SECOND_CLIENT_SECRET: ${{ secrets.YOUTUBE_SECOND_CLIENT_SECRET }}
+      YOUTUBE_SECOND_REFRESH_TOKEN: ${{ secrets.YOUTUBE_SECOND_REFRESH_TOKEN }}
+      YOUTUBE_TARGET_CHANNEL: ${{ vars.YOUTUBE_TARGET_CHANNEL || 'second' }}
+      YOUTUBE_VISIBILITY: ${{ vars.YOUTUBE_VISIBILITY || 'private' }}
+      OUTRO_ASSET_PATH: ${{ vars.OUTRO_ASSET_PATH || 'assets/outro.mp4' }}
 
     steps:
       - name: Checkout repository
@@ -57,6 +64,22 @@ jobs:
           echo "node version: $(node --version)"
           echo "ffmpeg version: $(ffmpeg -version | head -n 1)"
           echo "========================="
+
+      - name: Audit second-channel config
+        run: |
+          echo "=== Second-Channel Config Audit (presence only, never values) ==="
+          echo "YOUTUBE_TARGET_CHANNEL: $YOUTUBE_TARGET_CHANNEL"
+          echo "YOUTUBE_VISIBILITY: $YOUTUBE_VISIBILITY"
+          echo "OUTRO_ASSET_PATH: $OUTRO_ASSET_PATH"
+          if [ -n "$YOUTUBE_SECOND_CLIENT_ID" ]; then echo "YOUTUBE_SECOND_CLIENT_ID: SET"; else echo "YOUTUBE_SECOND_CLIENT_ID: MISSING"; fi
+          if [ -n "$YOUTUBE_SECOND_CLIENT_SECRET" ]; then echo "YOUTUBE_SECOND_CLIENT_SECRET: SET"; else echo "YOUTUBE_SECOND_CLIENT_SECRET: MISSING"; fi
+          if [ -n "$YOUTUBE_SECOND_REFRESH_TOKEN" ]; then echo "YOUTUBE_SECOND_REFRESH_TOKEN: SET"; else echo "YOUTUBE_SECOND_REFRESH_TOKEN: MISSING"; fi
+          if [ -f "$OUTRO_ASSET_PATH" ]; then
+            echo "Outro asset: FOUND ($OUTRO_ASSET_PATH)"
+          else
+            echo "Outro asset: MISSING ($OUTRO_ASSET_PATH) — Facebook jobs will fail fast, first-channel jobs unaffected"
+          fi
+          echo "=================================================================="
 
       - name: Verify YOUTUBE_COOKIES secret
         run: |

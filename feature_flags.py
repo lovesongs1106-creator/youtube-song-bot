@@ -9,3 +9,6 @@ ENABLE_AUTO_MODE = True  # Phase 5
 ENABLE_OUTRO_ROTATION_V2 = True
 ENABLE_DASHBOARD = True
 ENABLE_SYSTEM_HEALTH = True
+
+# Facebook -> second YouTube channel automation
+ENABLE_FACEBOOK_SECOND_CHANNEL = True

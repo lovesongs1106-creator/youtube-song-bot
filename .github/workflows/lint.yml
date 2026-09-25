@@ -22,8 +22,11 @@ jobs:
         run: |
           python -m py_compile \
             telegram_bot.py bot.py github_worker.py downloaders.py \
-            convert_cookies.py test_pipeline.py \
+            facebook_pipeline.py convert_cookies.py test_pipeline.py \
             agents/*.py scripts/*.py
 
       - name: Run stdlib smoke test (no deps, no network)
         run: python scripts/smoke_test.py
+
+      - name: Validate GitHub Actions workflows
+        run: python scripts/validate_workflow.py
