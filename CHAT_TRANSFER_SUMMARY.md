@@ -1,5 +1,14 @@
 # CHAT TRANSFER SUMMARY — YouTube Song Bot V2
 
+> ⚠️ **SECURITY NOTICE (2026-09-25 takeover):** This file previously contained
+> live credentials (GitHub PAT, Render API token, Telegram bot token, Supabase
+> password, DATABASE_URL). They have been **redacted** from the working tree
+> because committing secrets to git is a critical security risk.
+> If these credentials were ever pushed to GitHub, **rotate ALL of them now**:
+> GitHub PAT, Render API key, Telegram bot token (via @BotFather `/revoke`),
+> Supabase DB password, and webhook secret. Then update Render env vars,
+> GitHub Actions secrets, and redeploy. See `PROJECT_TAKEOVER.md` § Security.
+
 **Date:** 2026-07-20 (today's local date)  
 **Branch:** `feature/agent-reach-automation-v1`  
 **Repo:** https://github.com/lovesongs1106-creator/youtube-song-bot  
@@ -13,7 +22,7 @@
 
 ### 1. Workspace Status
 - `/home/user/youtube-song-bot/` was EMPTY at start
-- Repo cloned successfully with GitHub PAT: `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`
+- Repo cloned successfully with GitHub PAT: `***REDACTED-GITHUB-PAT***`
 - Workspace now contains full repo (`youtube-song-bot/`)
 
 ### 2. GitHub Repo Status
@@ -23,7 +32,7 @@
 - Latest commit in repo: `74a9203` (message: fix psycopg2 connection errors and fallback to SQLite)
 - Previous live commit: `0c45a39` (message: feat: /worker_status + GitHub tracking)
 
-### 3. Render Service Evidence (via API token `rnd_LVlLlK1lFINQnYK7iVRn7cWWi6VA`)
+### 3. Render Service Evidence (via API token `***REDACTED-RENDER-TOKEN***`)
 - Service ID: `srv-d8vo7kbtqb8s73f1gtkg`
 - Name: `youtube-song-bot`
 - URL: `https://youtube-song-bot.onrender.com`
@@ -31,10 +40,10 @@
 - Deploy status for `74a9203`: `update_failed`
 - Previous live deploy (`0c45a39`): `live`
 - Render DATABASE_URL env var (verified via API):
-  `postgresql://postgres.vckbjanbeovtqszsmfte:buzZug-mattym-jymby5@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres`
+  `***REDACTED-DATABASE-URL-POOLER***`
 
 ### 4. Database Connection Evidence
-- Existing `DATABASE_URL` (direct IPv6): `postgresql://postgres:buzZug-mattym-jymby5@db.vckbjanbeovtqszsmfte.supabase.co:5432/postgres`
+- Existing `DATABASE_URL` (direct IPv6): `***REDACTED-DATABASE-URL-DIRECT***`
 - Connection to direct URL: FAILED — `Network is unreachable` (IPv6 only, Render is IPv4-only)
 - Connection to pooler URL (`aws-0-ap-southeast-2.pooler.supabase.com:6543`): SUCCESS — PostgreSQL 17.6
 - DB response: `(1,)` (SELECT 1 works)
@@ -76,7 +85,7 @@
 
 ### 9. No Synthetic Data / No Placeholders Used
 - All DB connections tested with real credentials
-- All API calls made with real `rnd_LVlLlK1lFINQnYK7iVRn7cWWi6VA`
+- All API calls made with real `***REDACTED-RENDER-TOKEN***`
 - All file modifications are actual code changes in workspace files
 - No mock objects or synthetic rows inserted
 
@@ -122,23 +131,23 @@
 
 **GitHub:**
 - Repo: `lovesongs1106-creator/youtube-song-bot`
-- PAT: `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`
+- PAT: `***REDACTED-GITHUB-PAT***`
 - Branch: `feature/agent-reach-automation-v1`
 
 **Render:**
 - Service: `srv-d8vo7kbtqb8s73f1gtkg`
 - URL: `https://youtube-song-bot.onrender.com`
-- API Token: `rnd_LVlLlK1lFINQnYK7iVRn7cWWi6VA`
+- API Token: `***REDACTED-RENDER-TOKEN***`
 
 **Telegram:**
-- Bot Token: `8942140556:AAFepBCIQO_M8ccJBGRZK7kzVS4-2oHPcqU`
-- Webhook Secret: `mysecret12345`
+- Bot Token: `***REDACTED-TELEGRAM-BOT-TOKEN***`
+- Webhook Secret: `***REDACTED-WEBHOOK-SECRET***`
 - Authorized User ID: `1768510980`
 
 **Supabase:**
 - Project Ref: `vckbjanbeovtqszsmfte`
-- Password: `buzZug-mattym-jymby5`
-- DATABASE_URL (already set in Render env): `postgresql://postgres.vckbjanbeovtqszsmfte:buzZug-mattym-jymby5@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres`
+- Password: `***REDACTED-DB-PASSWORD***`
+- DATABASE_URL (already set in Render env): `***REDACTED-DATABASE-URL-POOLER***`
 
 **User Communication Style:**
 - Speaks Hindi-English mix (`"Bhai bot ready hai"`, `"Ni aa raha h"`)

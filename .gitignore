@@ -13,10 +13,29 @@ __pycache__/
 .venv/
 venv/
 
-# Environment
+# Environment / secrets — NEVER commit these
 .env
+.env.*
+!.env.example
+client_secrets.json
+token.json
+tokens/
+YOUTUBE_TOKEN_JSON.txt
+*token*.json
+cookies.txt
+youtube_cookies.*
 
-# Downloads
+# Downloads & generated output
 telegram_downloads/
 outputs/
-tokens/
+job_workspace/
+
+# Test reports
+test_pipeline_report.json
+*_report.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

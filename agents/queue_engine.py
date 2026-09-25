@@ -26,6 +26,17 @@ def add_queue_item(user_id: int, chat_id: int, song_name: str, youtube_url: str,
     if is_already_uploaded(youtube_url):
         return None
 
+    # DUPLICATE PROTECTION: Check if already in queue (pending or processing).
+    # Batch paths (add_multiple_items / transactional) already do this check;
+    # single-item inserts must behave the same so /new and approve flows
+    # can't enqueue the same URL twice.
+    existing = fetchone(
+        "SELECT id FROM upload_queue WHERE youtube_url = ? AND status IN ('pending', 'processing') LIMIT 1",
+        (youtube_url,)
+    )
+    if existing:
+        return None
+
     item_id = insert_and_get_id(
         """INSERT INTO upload_queue (user_id, chat_id, song_name, youtube_url, status, source, created_at)
            VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
