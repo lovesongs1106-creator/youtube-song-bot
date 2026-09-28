@@ -30,3 +30,21 @@ jobs:
 
       - name: Validate GitHub Actions workflows
         run: python scripts/validate_workflow.py
+
+  handler-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Telegram handler registration tests
+        run: python scripts/test_telegram_handlers.py

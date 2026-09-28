@@ -1698,6 +1698,37 @@ def _get_commit_hash() -> str:
         return "unknown"
 
 
+def _diag_webhook_status() -> dict[str, Any]:
+    """Live Telegram webhook state WITHOUT exposing secrets.
+
+    Never prints the webhook URL (it embeds WEBHOOK_SECRET) or the token.
+    Reports only booleans/counters plus the secret-redacted last error.
+    """
+    result: dict[str, Any] = {"check": "unavailable"}
+    try:
+        if telegram_app is None or BOT_LOOP is None:
+            result["reason"] = "bot not started yet"
+            return result
+        fut = asyncio.run_coroutine_threadsafe(
+            telegram_app.bot.get_webhook_info(), BOT_LOOP
+        )
+        info = fut.result(timeout=10)
+        url = info.url or ""
+        result = {
+            "check": "ok",
+            "webhook_set": bool(url),
+            "matches_base_url": bool(BASE_URL) and url.startswith(BASE_URL),
+            "pending_update_count": info.pending_update_count,
+            "last_error_date": info.last_error_date,
+            "last_error_message": (info.last_error_message or "").replace(
+                WEBHOOK_SECRET, "***")[:300],
+            "last_synchronization_error_date": info.last_synchronization_error_date,
+        }
+    except Exception as exc:
+        result = {"check": "error", "error": str(exc)[:200]}
+    return result
+
+
 @flask_app.route("/diag")
 def diag():
     """Production diagnostic endpoint. Returns trend engine, outro, and queue status.
@@ -1761,6 +1792,8 @@ def diag():
         },
         "github_worker": USE_GITHUB_WORKER,
         "github_repo": normalize_github_repo(GITHUB_REPO) if GITHUB_REPO else None,
+        "commands": sorted(KNOWN_COMMANDS),
+        "webhook": _diag_webhook_status(),
     }
 
 
@@ -2952,6 +2985,41 @@ async def second_channel_check_cmd(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(f"❌ Dispatch failed:\n{exc}")
 
 
+# Every command with a dedicated handler. Used by the unknown-command
+# catch-all (registered LAST) so genuinely-unknown commands get a helpful
+# reply instead of silence, while known commands never double-reply
+# (same-group handlers all fire, so the catch-all must stay quiet for these).
+KNOWN_COMMANDS = frozenset({
+    "start", "id", "auth", "export_youtube_token", "github_test",
+    "audio_retry", "trend_debug", "outro_list", "outro_remove", "outro_test",
+    "queue_status", "queue_pause", "auto_mode", "queue_resume",
+    "queue_cancel", "worker_status", "bulk_upload", "import_trends",
+    "upload", "upload_force", "status", "second_channel_check",
+    "outro_add", "agentreach", "new", "skip", "cancel", "daily_report",
+})
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all for unknown /commands. Registered LAST in group 0.
+
+    Replies only when the command is NOT in KNOWN_COMMANDS, so existing
+    commands (including conversation fallbacks like /skip and /cancel)
+    never receive a duplicate reply.
+    """
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message or not update.message.text:
+        return
+    first = update.message.text.strip().split()[0]
+    cmd = first.split("@")[0].lstrip("/").strip().lower()
+    if not cmd or cmd in KNOWN_COMMANDS:
+        return
+    await update.message.reply_text(
+        f"❓ Unknown command: /{cmd}\n\n"
+        "Send /start to see all available commands."
+    )
+
+
 def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -3059,6 +3127,14 @@ def build_telegram_app() -> Application:
         # Webhook-safe DB session callbacks
         app.add_handler(CallbackQueryHandler(agentreach_db_confirm_callback, pattern=r"^ar_confirm_"))
         app.add_handler(CallbackQueryHandler(agentreach_db_cancel_callback, pattern=r"^ar_cancel_"))
+
+    # Unknown-command catch-all MUST stay last: it only replies for commands
+    # outside KNOWN_COMMANDS, so nothing else can be shadowed or double-reply.
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+
+    # Startup inventory: proves in deploy logs exactly which commands are live.
+    print(f"[STARTUP] Registered commands ({len(KNOWN_COMMANDS)}): {', '.join(sorted(KNOWN_COMMANDS))}", flush=True)
+    print(f"[STARTUP] Handler groups: {sorted(app.handlers.keys())}, group-0 handlers: {len(app.handlers.get(0, []))}", flush=True)
 
     return app
 

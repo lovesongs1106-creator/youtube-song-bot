@@ -338,6 +338,37 @@ def main() -> int:
                 "vars.OUTRO_ASSET_PATH"):
         check(f"workflow references {ref}", ref in wf_src)
 
+    # ── Telegram command-registration hardening (stdlib AST checks) ──
+    tree = _ast.parse(tb_src)
+    fn_names = {n.name for n in _ast.walk(tree) if isinstance(n, _ast.AsyncFunctionDef)}
+    check("unknown_command handler defined", "unknown_command" in fn_names)
+    check("KNOWN_COMMANDS defined", "KNOWN_COMMANDS" in tb_src)
+    check(
+        "catch-all registered after all command handlers",
+        tb_src.find("MessageHandler(filters.COMMAND, unknown_command)")
+        > max(tb_src.find(f'CommandHandler("{c}"') for c in
+              ("upload", "upload_force", "status", "cancel", "auth", "second_channel_check")),
+    )
+    for c in ("unknown_command", "KNOWN_COMMANDS", "new_video", "upload_cmd",
+              "upload_force_cmd", "fb_status_cmd", "second_channel_check_cmd",
+              "cancel", "auth", "fb_job_status", "_diag_webhook_status"):
+        check(f"telegram_bot defines {c}", c in tb_src)
+    check("diag exposes registered commands", '"commands": sorted(KNOWN_COMMANDS)' in tb_src)
+    check("diag exposes redacted webhook status", '"webhook": _diag_webhook_status()' in tb_src)
+    check(
+        "diag webhook helper never prints secret-bearing URL",
+        "info.url or" in tb_src and "matches_base_url" in tb_src
+        and 'result["url"]' not in tb_src and "'url': info.url" not in tb_src,
+    )
+    check(
+        "startup prints handler inventory",
+        "[STARTUP] Registered commands" in tb_src,
+    )
+    check(
+        "PTB version pinned against major upgrades",
+        "python-telegram-bot>=21.4,<23" in (ROOT / "requirements.txt").read_text(encoding="utf-8"),
+    )
+
     print()
     if FAILURES:
         print(f"SMOKE TEST FAILED: {len(FAILURES)} check(s): {FAILURES}")
