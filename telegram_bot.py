@@ -67,6 +67,7 @@ from feature_flags import (
     ENABLE_OUTRO_ROTATION_V2,
     ENABLE_DASHBOARD,
     ENABLE_SYSTEM_HEALTH,
+    ENABLE_FACEBOOK_SECOND_CHANNEL,
 )
 
 from agents.viral_trend_engine import generate_daily_report, trend_debug_info, collect_and_save_trends, get_real_trends
@@ -2647,6 +2648,58 @@ async def run_auto_mode_scheduler(bot) -> None:
         await asyncio.sleep(600) # Check every 10 mins
 
 
+# ==================== /second_channel_check ====================
+# Minimal port from arena/01a0da9a-youtube-song-bot: only the
+# /second_channel_check command. Verifies second-channel OAuth +
+# outro asset via the GitHub worker.
+
+async def _fb_requirements_ok(update: Update) -> bool:
+    """Check flag + auth + worker mode. Replies with guidance on failure."""
+    if not ENABLE_FACEBOOK_SECOND_CHANNEL:
+        if update.message:
+            await update.message.reply_text("Facebook upload is currently disabled.")
+        return False
+    if await reject_if_unauthorized(update):
+        return False
+    if not update.message:
+        return False
+    if not USE_GITHUB_WORKER:
+        await update.message.reply_text(
+            "Facebook jobs need the GitHub Actions worker.\n"
+            "Set USE_GITHUB_WORKER=true in Render env and redeploy."
+        )
+        return False
+    return True
+
+
+async def second_channel_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/second_channel_check — verify second-channel OAuth + outro asset via worker."""
+    if not await _fb_requirements_ok(update):
+        return
+    if not BASE_URL:
+        await update.message.reply_text("BASE_URL missing — cannot build worker callbacks.")
+        return
+    job_id = f"fb-check-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    payload = {
+        "job_id": job_id,
+        "song_name": "Second channel check",
+        "chat_id": update.effective_chat.id,
+        "user_id": update.effective_user.id,
+        "mode": "second_channel_check",
+        "target_channel": "second",
+    }
+    await update.message.reply_text(
+        "🔍 Dispatching second-channel check to GitHub Actions...\n"
+        f"Job: {job_id}\n\n"
+        "The worker will verify YOUTUBE_SECOND_* secrets, confirm the "
+        "channel identity, and check assets/outro.mp4 — result ayega yahin."
+    )
+    try:
+        await asyncio.to_thread(dispatch_github_worker, payload)
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Dispatch failed:\n{exc}")
+
+
 def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -2667,6 +2720,10 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("worker_status", worker_status))
     app.add_handler(CommandHandler("bulk_upload", bulk_upload))
     app.add_handler(CommandHandler("import_trends", import_trends))
+
+    # Facebook -> second YouTube channel (isolated feature).
+    if ENABLE_FACEBOOK_SECOND_CHANNEL:
+        app.add_handler(CommandHandler("second_channel_check", second_channel_check_cmd))
 
     # Outro add conversation (polling mode)
     outro_conv = ConversationHandler(
