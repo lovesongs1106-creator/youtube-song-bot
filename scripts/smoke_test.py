@@ -305,6 +305,29 @@ def main() -> int:
         "fb pipeline honors OUTRO_ASSET_PATH",
         'OUTRO_ASSET_PATH' in fp_src and 'assets/outro.mp4' in fp_src,
     )
+    resolve_fn = next(
+        (n for n in _ast.walk(fp_tree) if isinstance(n, _ast.FunctionDef)
+         and n.name == "resolve_outro_asset"),
+        None,
+    )
+    resolve_src = _ast.get_source_segment(fp_src, resolve_fn) if resolve_fn else ""
+    check(
+        "resolve_outro_asset reads env with default + repo-root join",
+        resolve_fn is not None
+        and 'os.environ.get("OUTRO_ASSET_PATH"' in resolve_src
+        and "OUTRO_ASSET_DEFAULT" in resolve_src
+        and "__file__" in resolve_src,
+    )
+    outro_asset = ROOT / "assets" / "outro.mp4"
+    check(
+        "assets/outro.mp4 exists and non-empty",
+        outro_asset.is_file() and outro_asset.stat().st_size > 0,
+        f"{outro_asset.stat().st_size} bytes" if outro_asset.is_file() else "missing",
+    )
+    check(
+        "no stray root outro.mp4",
+        not (ROOT / "outro.mp4").exists(),
+    )
 
     wf_src = (ROOT / ".github" / "workflows" / "render-upload.yml").read_text(encoding="utf-8")
     for ref in ("secrets.YOUTUBE_SECOND_CLIENT_ID",

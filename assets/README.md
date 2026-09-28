@@ -6,9 +6,12 @@ The Facebook → second-channel pipeline appends a fixed outro file:
 assets/outro.mp4
 ```
 
-## Owner action required
+## Current asset
 
-Place your branded outro video at `assets/outro.mp4` in this repo and push.
+✅ `assets/outro.mp4` is present in this branch (branded outro, moved verbatim
+from the repository root on 2026-09-28 — binary bit-identical).
+
+To replace it with a new branded outro, overwrite `assets/outro.mp4` and push.
 Requirements:
 
 - Container: MP4 (H.264 video + AAC audio preferred; the pipeline normalizes
