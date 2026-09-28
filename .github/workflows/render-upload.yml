@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: arena/01a0da9a-youtube-song-bot
 
       - name: Install FFmpeg
         run: |
