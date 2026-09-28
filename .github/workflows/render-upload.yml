@@ -30,6 +30,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # CRITICAL: repository_dispatch ALWAYS executes the workflow file from
+          # the repo's DEFAULT branch, and a bare checkout would then run the
+          # default branch's worker code. Payloads carrying mode=
+          # second_channel_check (or any newer field) would be executed by old
+          # code that predates the mode routing and fall into the first-channel
+          # render pipeline (KeyError 'audio_file_id'). Pin the checkout to the
+          # branch carrying the worker fix so dispatched jobs always run code
+          # that understands them. After this workflow itself is merged to main,
+          # this ref can be switched to main.
+          ref: arena/01a0da9a-youtube-song-bot
 
       - name: Install FFmpeg
         run: |

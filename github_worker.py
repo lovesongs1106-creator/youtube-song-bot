@@ -208,7 +208,8 @@ def validate_second_channel_early() -> tuple[bool, str]:
         if not items:
             return False, "Second-channel auth OK but no channel found on this Google account."
         title = items[0]["snippet"]["title"]
-        return True, f"Second channel verified: '{title}' — upload ready."
+        cid = items[0].get("id", "?")
+        return True, f"Second channel verified: '{title}' (id: {cid}) — upload ready."
     except RuntimeError as exc:
         return False, str(exc)
     except Exception as exc:
@@ -289,38 +290,87 @@ def cleanup_job_dir(job_dir: Path) -> None:
         log(f"[FB] Temp cleanup warning: {exc}")
 
 
+def probe_outro_with_ffprobe(outro: Path) -> str | None:
+    """Optional deep probe: can FFmpeg/ffprobe actually read the outro file?
+
+    Returns None when the file reads fine, otherwise a WARNING string.
+    Never raises — the caller treats this probe as advisory only, so a
+    missing/broken FFmpeg on the worker can never fail an otherwise green
+    check. Pure inspection: no download, no render, no upload.
+    """
+    try:
+        import shutil
+        import subprocess
+        ffprobe = shutil.which("ffprobe")
+        if ffprobe:
+            cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                   "-of", "default=noprint_wrappers=1", str(outro)]
+        else:
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                return "⚠️ ffprobe/ffmpeg not available on worker — skipped deep outro probe."
+            cmd = [ffmpeg, "-v", "error", "-i", str(outro), "-f", "null", "-"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip()[:200] or "unknown error"
+            return f"⚠️ FFmpeg could not read outro asset ({detail}). File may be corrupt."
+        return None
+    except Exception as exc:
+        return f"⚠️ Outro probe skipped: {exc}"
+
+
 def run_second_channel_check(payload: dict[str, Any]) -> None:
-    """Validate second-channel secrets end-to-end and report to Telegram."""
+    """PURE health/credential check. NEVER downloads, renders, or uploads.
+
+    Needs NO audio_file_id and NO media input of any kind. Verifies:
+      1. YOUTUBE_SECOND_* secrets authenticate against the YouTube API
+      2. Authenticated channel identity (title + id)
+      3. Outro asset exists and is readable (+ optional FFmpeg probe)
+    Reports a clear PASS/FAIL back to Telegram.
+    """
     from facebook_pipeline import resolve_outro_asset
     chat_id = payload["chat_id"]
     job_id = payload.get("job_id", "second-channel-check")
     send_message(chat_id, f"🔍 Second-channel check started.\nJob: {job_id}")
 
-    log("=== Second Channel Check ===")
+    log("=== Second Channel Check (pure health check — no media, no render) ===")
     ok, msg = validate_second_channel_early()
-    log(f"[SECOND_CHECK] {msg}")
+    log(f"[SECOND_CHECK] auth: {msg}")
 
     outro = resolve_outro_asset()
-    outro_msg = f"✅ Outro asset found: {outro}" if outro.exists() else (
-        f"❌ Outro asset MISSING: {outro}\n"
-        "Add assets/outro.mp4 to the repo (or set OUTRO_ASSET_PATH)."
-    )
-    log(f"[SECOND_CHECK] {outro_msg}")
+    if not outro.exists():
+        outro_ok = False
+        outro_msg = (
+            f"❌ Outro asset MISSING: {outro}\n"
+            "Add assets/outro.mp4 to the repo (or set OUTRO_ASSET_PATH)."
+        )
+    elif not os.access(outro, os.R_OK):
+        outro_ok = False
+        outro_msg = f"❌ Outro asset NOT READABLE: {outro}"
+    else:
+        outro_ok = True
+        outro_msg = f"✅ Outro asset OK: {outro} ({outro.stat().st_size} bytes)"
+    log(f"[SECOND_CHECK] outro: {outro_msg}")
 
-    if ok and outro.exists():
+    probe_warning = probe_outro_with_ffprobe(outro) if outro_ok else None
+    if probe_warning:
+        log(f"[SECOND_CHECK] probe: {probe_warning}")
+
+    if ok and outro_ok:
         send_message(
             chat_id,
             "✅ Second channel check PASSED\n\n"
-            f"{msg}\n"
-            f"{outro_msg}\n\n"
-            f"Target: {YOUTUBE_TARGET_CHANNEL} | Visibility: {YOUTUBE_VISIBILITY}\n"
+            f"🔑 {msg}\n"
+            f"{outro_msg}\n"
+            + (f"{probe_warning}\n" if probe_warning else "")
+            + f"\nTarget: {YOUTUBE_TARGET_CHANNEL} | Visibility: {YOUTUBE_VISIBILITY}\n"
             "Facebook jobs (/upload) are ready to run."
         )
     else:
         send_message(
             chat_id,
             "❌ Second channel check FAILED\n\n"
-            f"{msg}\n"
+            f"🔑 {msg}\n"
             f"{outro_msg}\n\n"
             "Fix the items above, then run /second_channel_check again."
         )

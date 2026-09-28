@@ -369,6 +369,47 @@ def main() -> int:
         "python-telegram-bot>=21.4,<23" in (ROOT / "requirements.txt").read_text(encoding="utf-8"),
     )
 
+    # ── Worker checkout pin + pure second-channel check (stdlib AST checks) ──
+    # repository_dispatch runs the workflow from the DEFAULT branch, so the
+    # checkout MUST be pinned to the branch carrying the worker fix — otherwise
+    # new payloads (mode=second_channel_check) execute against ancient worker
+    # code that falls into the render pipeline (live KeyError 'audio_file_id').
+    check(
+        "workflow pins checkout ref to arena branch",
+        "ref: arena/01a0da9a-youtube-song-bot" in wf_src,
+    )
+    gw_src = (ROOT / "github_worker.py").read_text(encoding="utf-8")
+    gw_tree = _ast.parse(gw_src)
+    gw_fns = {n.name: n for n in _ast.walk(gw_tree) if isinstance(n, _ast.FunctionDef)}
+    check("worker defines run_second_channel_check", "run_second_channel_check" in gw_fns)
+    check("worker defines probe_outro_with_ffprobe", "probe_outro_with_ffprobe" in gw_fns)
+    check_fn = gw_fns.get("run_second_channel_check")
+    check_src = _ast.get_source_segment(gw_src, check_fn) or ""
+    # Exclude the docstring lines (they legitimately name what the check avoids).
+    check_lines = check_src.splitlines(keepends=True)
+    if (check_fn is not None and check_fn.body
+            and isinstance(check_fn.body[0], _ast.Expr)
+            and isinstance(check_fn.body[0].value, _ast.Constant)):
+        doc_node = check_fn.body[0]
+        start = doc_node.lineno - check_fn.lineno
+        end = (doc_node.end_lineno or doc_node.lineno) - check_fn.lineno + 1
+        del check_lines[start:end]
+    check_body = "".join(check_lines)
+    for banned in ("audio_file_id", "download_telegram_file", "render_video",
+                   "upload_to_youtube", "download_facebook_video",
+                   "process_facebook_video", "MediaFileUpload"):
+        check(f"pure check never touches {banned}", banned not in check_body)
+    for needed in ("validate_second_channel_early", "resolve_outro_asset",
+                   "probe_outro_with_ffprobe", "PASSED", "FAILED"):
+        check(f"pure check includes {needed}", needed in check_src)
+    main_src = _ast.get_source_segment(gw_src, gw_fns.get("main")) or ""
+    check(
+        "worker main routes mode=second_channel_check before render path",
+        'payload.get("mode") == "second_channel_check"' in main_src
+        and main_src.find("run_second_channel_check")
+        < main_src.find("YouTube token verified OK"),
+    )
+
     print()
     if FAILURES:
         print(f"SMOKE TEST FAILED: {len(FAILURES)} check(s): {FAILURES}")

@@ -48,3 +48,6 @@ jobs:
 
       - name: Run Telegram handler registration tests
         run: python scripts/test_telegram_handlers.py
+
+      - name: Run worker check/pipeline routing tests
+        run: python scripts/test_worker_check.py
