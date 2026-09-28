@@ -1,12 +1,41 @@
-# Secrets / tokens
-client_secrets.json
-token.json
-*.credentials.json
-
-# Generated media
-outputs/
+# Database files
+storage/*.db
+storage/*.sqlite
+storage/*.sqlite3
+*.db
+*.sqlite
+*.sqlite3
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
+venv/
+
+# Environment / secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+client_secrets.json
+token.json
+tokens/
+YOUTUBE_TOKEN_JSON.txt
+*token*.json
+cookies.txt
+youtube_cookies.*
+
+# Downloads & generated output
+telegram_downloads/
+outputs/
+job_workspace/
+
+# Test reports
+test_pipeline_report.json
+*_report.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -13,14 +13,34 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       YOUTUBE_TOKEN_JSON: ${{ secrets.YOUTUBE_TOKEN_JSON }}
       GOOGLE_CLIENT_SECRETS_JSON: ${{ secrets.GOOGLE_CLIENT_SECRETS_JSON }}
+      YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+      COBALT_API_URL: ${{ vars.COBALT_API_URL || 'https://cobalt-production-942b.up.railway.app/' }}
       VIDEO_WIDTH: ${{ vars.VIDEO_WIDTH || '1920' }}
       VIDEO_HEIGHT: ${{ vars.VIDEO_HEIGHT || '1080' }}
       VIDEO_FPS: ${{ vars.VIDEO_FPS || '30' }}
       FFMPEG_PRESET: ${{ vars.FFMPEG_PRESET || 'veryfast' }}
+      # Facebook -> second YouTube channel config (isolated from first channel).
+      YOUTUBE_SECOND_CLIENT_ID: ${{ secrets.YOUTUBE_SECOND_CLIENT_ID }}
+      YOUTUBE_SECOND_CLIENT_SECRET: ${{ secrets.YOUTUBE_SECOND_CLIENT_SECRET }}
+      YOUTUBE_SECOND_REFRESH_TOKEN: ${{ secrets.YOUTUBE_SECOND_REFRESH_TOKEN }}
+      YOUTUBE_TARGET_CHANNEL: ${{ vars.YOUTUBE_TARGET_CHANNEL || 'second' }}
+      YOUTUBE_VISIBILITY: ${{ vars.YOUTUBE_VISIBILITY || 'private' }}
+      OUTRO_ASSET_PATH: ${{ vars.OUTRO_ASSET_PATH || 'assets/outro.mp4' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # CRITICAL: repository_dispatch ALWAYS executes the workflow file from
+          # the repo's DEFAULT branch, and a bare checkout would then run the
+          # default branch's worker code. Payloads carrying mode=
+          # second_channel_check (or any newer field) would be executed by old
+          # code that predates the mode routing and fall into the first-channel
+          # render pipeline (KeyError 'audio_file_id'). Pin the checkout to the
+          # branch carrying the worker fix so dispatched jobs always run code
+          # that understands them. After this workflow itself is merged to main,
+          # this ref can be switched to main.
+          ref: arena/01a0da9a-youtube-song-bot
 
       - name: Install FFmpeg
         run: |
@@ -37,5 +57,108 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Update yt-dlp to latest
+        run: |
+          python -m pip install --upgrade yt-dlp
+          yt-dlp --version
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Environment audit
+        run: |
+          echo "=== Environment Audit ==="
+          echo "yt-dlp version: $(yt-dlp --version)"
+          echo "python version: $(python --version)"
+          echo "node version: $(node --version)"
+          echo "ffmpeg version: $(ffmpeg -version | head -n 1)"
+          echo "========================="
+
+      - name: Audit second-channel config
+        run: |
+          echo "=== Second-Channel Config Audit (presence only, never values) ==="
+          echo "YOUTUBE_TARGET_CHANNEL: $YOUTUBE_TARGET_CHANNEL"
+          echo "YOUTUBE_VISIBILITY: $YOUTUBE_VISIBILITY"
+          echo "OUTRO_ASSET_PATH: $OUTRO_ASSET_PATH"
+          if [ -n "$YOUTUBE_SECOND_CLIENT_ID" ]; then echo "YOUTUBE_SECOND_CLIENT_ID: SET"; else echo "YOUTUBE_SECOND_CLIENT_ID: MISSING"; fi
+          if [ -n "$YOUTUBE_SECOND_CLIENT_SECRET" ]; then echo "YOUTUBE_SECOND_CLIENT_SECRET: SET"; else echo "YOUTUBE_SECOND_CLIENT_SECRET: MISSING"; fi
+          if [ -n "$YOUTUBE_SECOND_REFRESH_TOKEN" ]; then echo "YOUTUBE_SECOND_REFRESH_TOKEN: SET"; else echo "YOUTUBE_SECOND_REFRESH_TOKEN: MISSING"; fi
+          if [ -f "$OUTRO_ASSET_PATH" ]; then
+            echo "Outro asset: FOUND ($OUTRO_ASSET_PATH)"
+          else
+            echo "Outro asset: MISSING ($OUTRO_ASSET_PATH) — Facebook jobs will fail fast, first-channel jobs unaffected"
+          fi
+          echo "=================================================================="
+
+      - name: Verify YOUTUBE_COOKIES secret
+        run: |
+          echo "=== YOUTUBE_COOKIES Audit ==="
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "Secret exists: YES"
+            echo "$YOUTUBE_COOKIES" > /tmp/youtube_cookies.txt
+            echo "Cookie file size: $(wc -c < /tmp/youtube_cookies.txt) bytes"
+            FIRST_LINE=$(head -n 1 /tmp/youtube_cookies.txt)
+            if echo "$FIRST_LINE" | grep -q "^# Netscape HTTP Cookie File"; then
+              echo "Cookie format: VALID (Netscape header found)"
+            else
+              echo "Cookie format: INVALID (first line: $FIRST_LINE)"
+            fi
+          else
+            echo "Secret exists: NO"
+            echo "Cookie file size: 0 bytes"
+            echo "Cookie format: MISSING"
+          fi
+          echo "=============================="
+
+      - name: Convert Netscape cookies to JSON for Cobalt
+        run: |
+          echo "=== Converting cookies to JSON format for Cobalt ==="
+          python convert_cookies.py /tmp/youtube_cookies.txt /tmp/youtube_cookies.json
+          echo "Cookie conversion done."
+          head -c 500 /tmp/youtube_cookies.json
+          echo ""
+          echo "======================================="
+
+      - name: Start local Cobalt API with JSON cookies
+        run: |
+          echo "=== Starting local Cobalt Docker container ==="
+          docker run -d \
+            --name cobalt-api \
+            -p 9000:9000 \
+            -e API_URL=http://localhost:9000 \
+            -e API_PORT=9000 \
+            -e COOKIE_PATH=/app/cookies.json \
+            -v /tmp/youtube_cookies.json:/app/cookies.json:ro \
+            ghcr.io/imputnet/cobalt:10
+          echo "Waiting for Cobalt to be ready..."
+          for i in {1..30}; do
+            if curl -sf http://localhost:9000/ > /dev/null 2>&1; then
+              echo "Cobalt is ready!"
+              break
+            fi
+            echo "Attempt $i/30..."
+            sleep 2
+          done
+          echo "Cobalt health check:"
+          curl -s http://localhost:9000/ || echo "Cobalt health check failed"
+          echo "======================================="
+
+      - name: Test Cobalt with a public video
+        run: |
+          echo "=== Testing Cobalt with Rick Astley (public video) ==="
+          curl -X POST http://localhost:9000/ \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","downloadMode":"audio","audioFormat":"mp3"}' \
+            -v || true
+          echo ""
+          echo "=== Cobalt container logs ==="
+          docker logs cobalt-api --tail 50 || true
+          echo "======================================="
+
       - name: Render and upload
+        env:
+          COBALT_API_URL: http://localhost:9000/
         run: python github_worker.py

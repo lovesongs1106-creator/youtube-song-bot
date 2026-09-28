@@ -192,54 +192,13 @@ def generate_thumbnail(song_name: str, artist: Optional[str], output: Path, size
 
 
 def download_youtube_audio(youtube_url: str, output_dir: Path) -> Path:
-    """Download/extract audio from a YouTube URL using yt-dlp.
+    """Download/extract audio from a YouTube URL.
 
+    Uses Cobalt API first, then yt-dlp fallback.
     Only use this for content you own, have licensed, or have explicit permission to reuse.
-    This function does not bypass DRM; it relies on yt-dlp/FFmpeg for normal extraction.
     """
-    check_ffmpeg()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    outtmpl = output_dir / "source_audio.%(ext)s"
-
-    # Prefer command-line yt-dlp because it is easier for users to update/debug.
-    if shutil.which("yt-dlp"):
-        run([
-            "yt-dlp",
-            "--no-playlist",
-            "--extract-audio",
-            "--audio-format", "mp3",
-            "--audio-quality", "0",
-            "--output", str(outtmpl),
-            youtube_url,
-        ])
-    else:
-        try:
-            import yt_dlp
-        except ImportError as exc:
-            raise SystemExit("Install yt-dlp first: pip install -r requirements.txt") from exc
-
-        opts = {
-            "format": "bestaudio/best",
-            "noplaylist": True,
-            "outtmpl": str(outtmpl),
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "0",
-            }],
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([youtube_url])
-
-    candidates = sorted(output_dir.glob("source_audio.*"))
-    mp3s = [c for c in candidates if c.suffix.lower() == ".mp3"]
-    if mp3s:
-        print(f"Downloaded audio: {mp3s[0]}")
-        return mp3s[0]
-    if candidates:
-        print(f"Downloaded audio: {candidates[0]}")
-        return candidates[0]
-    raise SystemExit("Could not find downloaded YouTube audio output.")
+    from downloaders import download_audio
+    return download_audio(youtube_url, output_dir)
 
 
 def get_youtube_title(youtube_url: str) -> Optional[str]:
@@ -534,9 +493,9 @@ def render_video(thumbnail: Path, audio: Path, outro: Path, output: Path, workdi
     workdir.mkdir(parents=True, exist_ok=True)
     main_video = workdir / "main_song_video.mp4"
     outro_norm = workdir / "outro_normalized.mp4"
-    concat_file = workdir / "concat.txt"
 
     # Main video: still thumbnail for whole audio duration.
+    # setpts=PTS-STARTPTS ensures clean timestamps starting from 0 for concat filter.
     run([
         "ffmpeg", "-y",
         "-loop", "1",
@@ -548,17 +507,20 @@ def render_video(thumbnail: Path, audio: Path, outro: Path, output: Path, workdi
         "-threads", "1",
         "-c:a", "aac",
         "-b:a", "160k",
+        "-ac", "2",
         "-pix_fmt", "yuv420p",
-        "-vf", f"scale={width}:{height},setsar=1,fps={fps}",
+        "-vf", f"setpts=PTS-STARTPTS,scale={width}:{height},setsar=1,fps={fps}",
         "-shortest",
         str(main_video),
     ])
 
     # Normalize outro to match concat requirements.
+    # setpts/asetpts reset timestamps to 0 so concat filter keeps perfect A/V sync.
     run([
         "ffmpeg", "-y",
         "-i", str(outro),
-        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}",
+        "-vf", f"setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}",
+        "-af", "asetpts=PTS-STARTPTS",
         "-c:v", "libx264",
         "-preset", preset,
         "-threads", "1",
@@ -566,21 +528,20 @@ def render_video(thumbnail: Path, audio: Path, outro: Path, output: Path, workdi
         "-c:a", "aac",
         "-b:a", "160k",
         "-ar", "44100",
+        "-ac", "2",
         str(outro_norm),
     ])
 
-    concat_file.write_text(
-        f"file '{main_video.resolve().as_posix()}'\nfile '{outro_norm.resolve().as_posix()}'\n",
-        encoding="utf-8",
-    )
-
     output.parent.mkdir(parents=True, exist_ok=True)
-    # Final concat WITHOUT -c copy (ensures audio never mutes)
+    # Final concat using concat FILTER for perfect A/V sync.
+    # concat demuxer (-f concat) causes audio drift/offset; concat filter is explicit and reliable.
     run([
         "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(concat_file),
+        "-i", str(main_video),
+        "-i", str(outro_norm),
+        "-filter_complex", f"[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]",
+        "-map", "[outv]",
+        "-map", "[outa]",
         "-c:v", "libx264",
         "-preset", preset,
         "-threads", "1",

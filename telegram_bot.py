@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
 Telegram front-end for YouTube Song Automation Bot.
+
+Mobile flow:
+  /auth -> connect YouTube channel once
+  /new  -> send YouTube song link -> send outro video -> bot generates + uploads
+
+Environment variables:
+  TELEGRAM_BOT_TOKEN              Required. From @BotFather.
+  BASE_URL                        Required for OAuth. Example: https://your-app.onrender.com
+  GOOGLE_CLIENT_SECRETS_JSON      Optional JSON string. If not set, uses client_secrets.json file.
+  AUTHORIZED_TELEGRAM_USER_ID     Optional. Restrict bot to one Telegram numeric user ID.
+  DEFAULT_PRIVACY                 Optional: private/unlisted/public. Default: private.
+  PORT                            Optional. Hosting provider usually sets this.
 """
 
 from __future__ import annotations
@@ -50,11 +62,39 @@ from feature_flags import (
     ENABLE_TREND_AGENT,
     ENABLE_RECOMMENDATIONS,
     ENABLE_APPROVE_WORKFLOW,
+    ENABLE_BULK_UPLOAD,
+    ENABLE_AGENTREACH_IMPORT,
+    ENABLE_OUTRO_ROTATION_V2,
+    ENABLE_DASHBOARD,
+    ENABLE_SYSTEM_HEALTH,
+    ENABLE_FACEBOOK_SECOND_CHANNEL,
 )
 
-from agents.simple_trend import generate_daily_report
+from agents import fb_jobs as fb_job_manager
 
-WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO, WAITING_RETRY_AUDIO = range(6)
+from agents.viral_trend_engine import generate_daily_report, trend_debug_info, collect_and_save_trends, get_real_trends
+from agents.outro_manager import (
+    add_outro,
+    list_outros,
+    remove_outro,
+    select_outro,
+    record_outro_usage,
+    format_outro_list,
+)
+from agents.queue_engine import (
+    add_multiple_items,
+    add_multiple_items_transactional,
+    get_summary,
+    get_queue,
+    cancel_all_pending,
+    is_paused,
+    set_paused,
+    run_queue_processor,
+    add_queue_item,
+)
+from agents.db import init_all_tables, is_already_uploaded, fetchone
+
+WAITING_TITLE, WAITING_ARTIST, WAITING_REFERENCE, WAITING_LINK, WAITING_OUTRO, WAITING_RETRY_AUDIO, WAITING_OUTRO_VIDEO, WAITING_OUTRO_NAME, WAITING_OUTRO_WEIGHT, WAITING_AGENTREACH = range(10)
 
 ROOT = Path(__file__).parent.resolve()
 TOKENS_DIR = ROOT / "tokens"
@@ -73,23 +113,27 @@ if DEFAULT_PRIVACY not in {"private", "unlisted", "public"}:
 
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".webm"}
 
+# Webhook mode is better for free hosting because incoming Telegram messages wake the app.
 USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "true").strip().lower() in {"1", "true", "yes", "on"}
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me-secret").strip()
 
+# If true, Render only controls Telegram and dispatches heavy video work to GitHub Actions.
 USE_GITHUB_WORKER = os.environ.get("USE_GITHUB_WORKER", "false").strip().lower() in {"1", "true", "yes", "on"}
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()  # example: username/youtube-song-bot
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()  # PAT with repo dispatch permission
 GITHUB_EVENT_TYPE = os.environ.get("GITHUB_EVENT_TYPE", "render_video").strip()
 
 GOOGLE_CLIENT_SECRETS_PATH = ROOT / "client_secrets.json"
 if os.environ.get("GOOGLE_CLIENT_SECRETS_JSON") and not GOOGLE_CLIENT_SECRETS_PATH.exists():
     GOOGLE_CLIENT_SECRETS_PATH.write_text(os.environ["GOOGLE_CLIENT_SECRETS_JSON"], encoding="utf-8")
 
+# In-memory OAuth state -> Telegram user ID + PKCE verifier mapping.
 OAUTH_STATES: dict[str, dict[str, Any]] = {}
 PENDING_RETRY_JOBS: dict[int, dict[str, Any]] = {}
 telegram_app: Application | None = None
 BOT_LOOP: asyncio.AbstractEventLoop | None = None
 flask_app = Flask(__name__)
+# Render/other hosts terminate HTTPS at a proxy. This makes Flask respect X-Forwarded-Proto=https.
 flask_app.wsgi_app = ProxyFix(flask_app.wsgi_app, x_proto=1, x_host=1)
 
 
@@ -142,8 +186,22 @@ def youtube_authed_for_user(user_id: int):
     creds = Credentials.from_authorized_user_file(str(token_path), YOUTUBE_UPLOAD_SCOPE)
     if not creds.valid:
         if creds.expired and creds.refresh_token:
-            creds.refresh(GoogleRequest())
-            token_path.write_text(creds.to_json(), encoding="utf-8")
+            try:
+                creds.refresh(GoogleRequest())
+                token_path.write_text(creds.to_json(), encoding="utf-8")
+            except Exception as refresh_exc:
+                err_str = str(refresh_exc).lower()
+                if "invalid_grant" in err_str:
+                    raise RuntimeError(
+                        "YouTube token EXPIRED/REVOKED.\n\n"
+                        "FIX:\n"
+                        "1. /auth bhejo\n"
+                        "2. Google login karo\n"
+                        "3. /export_youtube_token bhejo\n"
+                        "4. GitHub Secret YOUTUBE_TOKEN_JSON me paste karo\n\n"
+                        f"Error: {refresh_exc}"
+                    )
+                raise RuntimeError(f"YouTube token refresh failed: {refresh_exc}")
         else:
             raise RuntimeError("YouTube token expired. Send /auth again.")
     return build("youtube", "v3", credentials=creds)
@@ -194,13 +252,19 @@ def extract_youtube_url(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+
+
+
+
 def normalize_github_repo(raw: str) -> str:
+    """Accept owner/repo OR GitHub URL and return owner/repo."""
     repo = (raw or "").strip()
     repo = repo.replace("https://github.com/", "").replace("http://github.com/", "")
     repo = repo.replace("github.com/", "")
     repo = repo.strip().strip("/")
     if repo.endswith(".git"):
         repo = repo[:-4]
+    # If user pasted URL with extra path, keep only owner/repo
     parts = [x for x in repo.split("/") if x]
     if len(parts) >= 2:
         return f"{parts[0]}/{parts[1]}"
@@ -246,7 +310,6 @@ def github_repo_diagnostics() -> str:
         )
     return f"❌ GitHub repo check failed: {r.status_code}\n{r.text[:1000]}"
 
-
 def dispatch_github_worker(payload: dict[str, Any]) -> None:
     if not GITHUB_REPO:
         raise RuntimeError("GITHUB_REPO env var missing. Example: yourname/youtube-song-bot")
@@ -254,6 +317,8 @@ def dispatch_github_worker(payload: dict[str, Any]) -> None:
         raise RuntimeError("GITHUB_TOKEN env var missing. Add GitHub PAT in Render env.")
     repo = normalize_github_repo(GITHUB_REPO)
     url = f"https://api.github.com/repos/{repo}/dispatches"
+    # GitHub repository_dispatch allows max 10 top-level client_payload properties.
+    # Wrap everything inside one `job` object to avoid 422 errors.
     body = {"event_type": GITHUB_EVENT_TYPE, "client_payload": {"job": payload}}
     r = requests.post(url, headers=github_headers(), json=body, timeout=60)
     if r.status_code not in (200, 201, 202, 204):
@@ -267,84 +332,23 @@ def dispatch_github_worker(payload: dict[str, Any]) -> None:
                 "GITHUB_TOKEN=PAT with repo access"
             )
         raise RuntimeError(f"GitHub dispatch failed: {r.status_code} {r.text[:1000]}")
-
-
-# ==================== DAILY REPORT + APPROVE WORKFLOW ====================
-
-async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await reject_if_unauthorized(update):
-        return
-    if not ENABLE_RECOMMENDATIONS:
-        await update.message.reply_text("Trend recommendations are currently disabled.")
-        return
-
-    report_text = generate_daily_report()
-
-    keyboard = [
-        [InlineKeyboardButton("Approve Song", callback_data="approve_song")],
-        [InlineKeyboardButton("Refresh", callback_data="refresh_report")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(report_text, reply_markup=reply_markup)
-
-
-async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    if not ENABLE_APPROVE_WORKFLOW:
-        await query.edit_message_text("Approve workflow is currently disabled.")
-        return
-
-    song_name = "Sample Trending Song"
-    artist = "Sample Artist"
-
-    metadata = generate_seo_metadata(song_name, artist, None)
-
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    payload = {
-        "job_id": f"trend-{stamp}",
-        "chat_id": update.effective_chat.id,
-        "user_id": update.effective_user.id,
-        "song_name": song_name,
-        "artist": artist,
-        "source_type": "telegram_audio",
-        "privacy": DEFAULT_PRIVACY,
-        "custom_title": metadata["title"],
-        "custom_description": metadata["description"],
-        "custom_tags": metadata["tags"],
-    }
-
-    await asyncio.to_thread(dispatch_github_worker, payload)
-
-    await query.edit_message_text(
-        f"✅ Approved!\n\n"
-        f"Title: {metadata['title']}\n"
-        f"Privacy: {DEFAULT_PRIVACY}\n\n"
-        "🚀 Job sent to GitHub Actions. You will receive the private YouTube link here."
-    )
-
-
-async def refresh_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    if not ENABLE_RECOMMENDATIONS:
-        await query.edit_message_text("Trend recommendations are currently disabled.")
-        return
-
-    report_text = generate_daily_report()
-    keyboard = [
-        [InlineKeyboardButton("Approve Song", callback_data="approve_song")],
-        [InlineKeyboardButton("Refresh", callback_data="refresh_report")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(report_text, reply_markup=reply_markup)
-
-
-# ==================== OLD FUNCTIONS (KEEPING ALL) ====================
+    # Track job in database for /worker_status
+    job_id = payload.get("job_id", "unknown")
+    song_name = payload.get("song_name", "Unknown")
+    now = dt.datetime.now().isoformat()
+    try:
+        from agents.db import execute
+        execute(
+            """INSERT INTO github_jobs (job_id, song_name, status, stage, dispatched_at, updated_at)
+               VALUES (?, ?, 'dispatched', 'queued', ?, ?)
+               ON CONFLICT(job_id) DO UPDATE SET
+                   status=excluded.status,
+                   stage=excluded.stage,
+                   updated_at=excluded.updated_at""",
+            (job_id, song_name, now, now)
+        )
+    except Exception as e:
+        print(f"[WORKER] Failed to track job dispatch: {e}", flush=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
@@ -357,17 +361,1251 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Default privacy: {DEFAULT_PRIVACY}\n\n"
         "Commands:\n"
         "/auth - YouTube channel connect karo\n"
-        "/export_youtube_token - GitHub Actions secret ke liye token export karo\n"
-        "/github_test - GitHub repo/token connection check karo\n"
         "/new - Naya video banao aur upload karo\n"
+        "/import_trends - Trending songs import karo\n"
+        "/bulk_upload - Multiple songs queue karo\n"
+        "/queue_status - Upload queue dekho\n"
+        "/queue_pause - Queue roko\n"
+        "/queue_resume - Queue chalao\n"
+        "/queue_cancel - Pending items cancel karo\n"
+        "/worker_status - GitHub worker status dekho\n"
+        "/daily_report - Viral trends dekho\n"
+        "/trend_debug - Trend engine diagnostics\n"
+        "/outro_add - Outro video add karo\n"
+        "/outro_list - Sab outro videos dekho\n"
+        "/outro_remove <id> - Outro hatao\n"
+        "/outro_test - Selection test karo\n"
+        "/github_test - GitHub connection check\n"
+        "/export_youtube_token - Token export karo\n"
         "/id - Apna Telegram user ID dekho\n"
-        "/cancel - Current process cancel"
+        "/cancel - Current process cancel\n"
+        "\n"
+        "Facebook (second channel):\n"
+        "/upload - FB video second channel par bhejo\n"
+        "/upload_force - Retry / duplicate bypass\n"
+        "/status - FB job status dekho\n"
+        "/second_channel_check - Setup verify karo"
     )
 
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user and update.message:
         await update.message.reply_text(f"Your Telegram user ID: {update.effective_user.id}")
+
+
+# ==================== OUTRO MANAGEMENT COMMANDS ====================
+
+async def outro_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    file_id = None
+    ext = ".mp4"
+    name = "outro"
+
+    if update.message.video:
+        file_id = update.message.video.file_id
+        ext = ".mp4"
+        name = update.message.video.file_name or "outro_video"
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        name = update.message.document.file_name or "outro"
+        ext = Path(name).suffix or ".mp4"
+        mime = update.message.document.mime_type or ""
+        if not (ext in {".mp4", ".mov", ".mkv", ".webm"} or mime.startswith("video/")):
+            await update.message.reply_text("Please send a video file (MP4/MOV/MKV/WEBM).")
+            return
+    else:
+        await update.message.reply_text(
+            "Send an outro video as a Telegram video or document.\n"
+            "Optional: reply with /outro_add <name> <weight> to set metadata."
+        )
+        return
+
+    # Parse optional name/weight from caption or command args
+    weight = 10
+    custom_name = None
+    if context.args:
+        custom_name = context.args[0]
+        if len(context.args) > 1:
+            try:
+                weight = int(context.args[1])
+            except ValueError:
+                pass
+
+    outro_name = custom_name or Path(name).stem or "outro"
+    outro_id = add_outro(outro_name, file_id, ext, weight)
+    from agents.db import is_using_postgres
+    ephemeral_warning = ""
+    if not is_using_postgres():
+        ephemeral_warning = "\n\n⚠️ WARNING: SQLite ephemeral storage active. Outros will be lost when Render restarts. Add DATABASE_URL env var for persistence."
+    await update.message.reply_text(
+        f"✅ Outro added!\n\n"
+        f"ID: {outro_id}\n"
+        f"Name: {outro_name}\n"
+        f"Weight: {weight}\n"
+        f"Ext: {ext}\n\n"
+        f"Total active outros: {len(list_outros())}"
+        f"{ephemeral_warning}"
+    )
+
+
+async def outro_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    await update.message.reply_text(format_outro_list())
+
+
+async def outro_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /outro_remove <id>\n\nUse /outro_list to see IDs.")
+        return
+    try:
+        outro_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID must be a number.")
+        return
+
+    if remove_outro(outro_id):
+        await update.message.reply_text(f"✅ Outro {outro_id} removed.")
+    else:
+        await update.message.reply_text(f"❌ Outro {outro_id} not found.")
+
+
+async def outro_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    selected = select_outro()
+    if not selected:
+        await update.message.reply_text(
+            "📭 No active outros available.\n\nUse /outro_add to upload outro videos first."
+        )
+        return
+
+    await update.message.reply_text(
+        f"🎲 Outro Selection Test\n\n"
+        f"Selected: {selected['name']}\n"
+        f"ID: {selected['outro_id']}\n"
+        f"Ext: {selected['ext']}\n\n"
+        f"This outro would be used for the next upload."
+    )
+
+
+# ==================== BULK UPLOAD QUEUE COMMANDS (WEBHOOK-SAFE) ====================
+
+def _store_bulk_session(user_id: int, candidates: list, invalid: list) -> str:
+    """Store bulk upload session in DB for webhook-safe retrieval."""
+    import json, secrets
+    from agents.db import execute
+    session_id = secrets.token_urlsafe(16)
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"bulk_{user_id}_{session_id}", json.dumps({
+            "candidates": candidates,
+            "invalid": invalid,
+            "created_at": dt.datetime.now().isoformat(),
+        }))
+    )
+    return session_id
+
+
+def _load_bulk_session(user_id: int, session_id: str) -> dict | None:
+    import json
+    from agents.db import fetchone, execute
+    row = fetchone("SELECT value FROM system_state WHERE key = ?", (f"bulk_{user_id}_{session_id}",))
+    if not row:
+        return None
+    execute("DELETE FROM system_state WHERE key = ?", (f"bulk_{user_id}_{session_id}",))
+    return json.loads(row["value"])
+
+
+def _parse_bulk_lines(lines: list[str]) -> tuple[list[dict], list[tuple]]:
+    """Parse bulk upload lines. Returns (valid_items, invalid_items)."""
+    valid = []
+    invalid = []
+    for line in lines:
+        if "|" not in line:
+            invalid.append((line, "Missing | separator"))
+            continue
+        parts = [p.strip() for p in line.split("|", 1)]
+        song_name = parts[0]
+        url = extract_youtube_url(parts[1]) if len(parts) > 1 else None
+        if not song_name:
+            invalid.append((line, "Missing song name"))
+            continue
+        if not url:
+            invalid.append((line, "Invalid or missing YouTube URL"))
+            continue
+        valid.append({"song_name": song_name, "youtube_url": url})
+    return valid, invalid
+
+
+async def bulk_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe /bulk_upload — stores awaiting flag in DB."""
+    print("[BULK_UPLOAD_START] command received", flush=True)
+    if await reject_if_unauthorized(update):
+        print("[BULK_UPLOAD_START] unauthorized", flush=True)
+        return
+    if not update.message:
+        print("[BULK_UPLOAD_START] no message", flush=True)
+        return
+    user_id = update.effective_user.id
+    # Store awaiting flag in DB (webhook-safe)
+    from agents.db import execute
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"bulk_awaiting_{user_id}", "true")
+    )
+    print(f"[BULK_UPLOAD_START] awaiting flag set for user={user_id}", flush=True)
+    await update.message.reply_text(
+        "📥 Bulk Upload Mode\n\n"
+        "Send a list of songs in this format:\n\n"
+        "Song Name 1 | https://youtube.com/watch?v=abc\n"
+        "Song Name 2 | https://youtube.com/watch?v=def\n"
+        "Song Name 3 | https://youtube.com/watch?v=ghi\n\n"
+        "One song per line. Use | to separate name and URL."
+    )
+
+
+async def handle_bulk_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages when user is in bulk upload or import_trends mode. Webhook-safe via DB."""
+    if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_user.id
+    from agents.db import fetchone, execute
+
+    # First check if user is in import_trends mode
+    import_awaiting = fetchone(
+        "SELECT value FROM system_state WHERE key = ?",
+        (f"import_trends_awaiting_{user_id}",)
+    )
+    if import_awaiting and import_awaiting.get("value") == "true":
+        await handle_import_trends_text(update, context)
+        return
+
+    # Then check if user is in bulk upload mode
+    print("[BULK_UPLOAD_RECEIVED] text handler triggered", flush=True)
+    awaiting_row = fetchone(
+        "SELECT value FROM system_state WHERE key = ?",
+        (f"bulk_awaiting_{user_id}",)
+    )
+    if not awaiting_row or awaiting_row.get("value") != "true":
+        print(f"[BULK_UPLOAD_RECEIVED] user={user_id} not awaiting bulk", flush=True)
+        return
+
+    print(f"[BULK_UPLOAD_RECEIVED] user={user_id} is awaiting, parsing...", flush=True)
+    text = update.message.text.strip()
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    print(f"[BULK_UPLOAD_PARSED] {len(lines)} lines", flush=True)
+
+    valid, invalid = _parse_bulk_lines(lines)
+    print(f"[BULK_UPLOAD_PARSED] valid={len(valid)} invalid={len(invalid)}", flush=True)
+
+    # Clear awaiting flag
+    execute("DELETE FROM system_state WHERE key = ?", (f"bulk_awaiting_{user_id}",))
+
+    # Store session for confirm/callback
+    session_id = _store_bulk_session(user_id, valid, invalid)
+    print(f"[BULK_UPLOAD_PARSED] session_id={session_id}", flush=True)
+
+    summary = (
+        f"📊 Bulk Upload Summary\n\n"
+        f"Total lines: {len(lines)}\n"
+        f"✅ Valid: {len(valid)}\n"
+        f"❌ Invalid: {len(invalid)}\n\n"
+    )
+    if valid:
+        summary += "Valid songs:\n"
+        for i, item in enumerate(valid[:10], 1):
+            summary += f"{i}. {item['song_name']}\n"
+        if len(valid) > 10:
+            summary += f"... and {len(valid) - 10} more\n"
+    if invalid:
+        summary += "\nInvalid entries:\n"
+        for item, reason in invalid[:5]:
+            summary += f"• {item[:40]}... ({reason})\n"
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Confirm Upload", callback_data=f"bulk_confirm_{session_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"bulk_cancel_{session_id}")],
+    ]
+    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def bulk_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe bulk confirm using DB session."""
+    print("[BULK_UPLOAD_QUEUE_INSERT] confirm callback", flush=True)
+    query = update.callback_query
+    await query.answer()
+
+    callback_data = query.data or ""
+    session_id = callback_data.replace("bulk_confirm_", "")
+    user_id = update.effective_user.id
+    session = _load_bulk_session(user_id, session_id)
+    if not session:
+        print(f"[BULK_UPLOAD_QUEUE_INSERT] session not found: {session_id}", flush=True)
+        await query.edit_message_text("❌ Session expired. Send /bulk_upload again.")
+        return
+
+    candidates = session.get("candidates", [])
+    if not candidates:
+        await query.edit_message_text("❌ No valid songs to upload.")
+        return
+
+    chat_id = update.effective_chat.id
+    print(f"[BULK_UPLOAD_QUEUE_INSERT] adding {len(candidates)} items", flush=True)
+    ids = add_multiple_items(user_id, chat_id, candidates)
+    print(f"[BULK_UPLOAD_QUEUE_INSERT] added_ids={ids}", flush=True)
+
+    await query.edit_message_text(
+        f"✅ {len(ids)} songs added to upload queue!\n\n"
+        f"Use /queue_status to check progress.\n"
+        f"The queue processor will start automatically."
+    )
+
+
+async def bulk_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe bulk cancel using DB session."""
+    print("[BULK_UPLOAD_CANCEL] cancel callback", flush=True)
+    query = update.callback_query
+    await query.answer()
+    callback_data = query.data or ""
+    session_id = callback_data.replace("bulk_cancel_", "")
+    user_id = update.effective_user.id
+    _load_bulk_session(user_id, session_id)  # load + delete
+    await query.edit_message_text("❌ Bulk upload cancelled.")
+
+
+# ==================== IMPORT TRENDS (PRIMARY WORKFLOW) ====================
+
+def _store_import_trends_session(user_id: int, trends: list) -> str:
+    """Store import trends session in DB for webhook-safe retrieval."""
+    import json, secrets
+    from agents.db import execute
+    session_id = secrets.token_urlsafe(16)
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"import_trends_{user_id}_{session_id}", json.dumps({
+            "trends": trends,
+            "created_at": dt.datetime.now().isoformat(),
+        }))
+    )
+    return session_id
+
+
+def _load_import_trends_session(user_id: int, session_id: str) -> dict | None:
+    import json
+    from agents.db import fetchone, execute
+    row = fetchone("SELECT value FROM system_state WHERE key = ?", (f"import_trends_{user_id}_{session_id}",))
+    if not row:
+        return None
+    execute("DELETE FROM system_state WHERE key = ?", (f"import_trends_{user_id}_{session_id}",))
+    return json.loads(row["value"])
+
+
+def _parse_import_trend_lines(lines: list[str]) -> tuple[list[dict], list[tuple]]:
+    """Parse trend import lines. Returns (valid_trends, invalid_items)."""
+    valid = []
+    invalid = []
+    seen_urls = set()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if "|" not in line:
+            invalid.append((line, "Missing | separator"))
+            continue
+        parts = [p.strip() for p in line.split("|", 1)]
+        song_name = parts[0]
+        url = extract_youtube_url(parts[1]) if len(parts) > 1 else None
+        if not song_name:
+            invalid.append((line, "Missing song name"))
+            continue
+        if not url:
+            invalid.append((line, "Invalid or missing YouTube URL"))
+            continue
+        if url in seen_urls:
+            invalid.append((line, "Duplicate URL in batch"))
+            continue
+        seen_urls.add(url)
+        valid.append({"song_name": song_name, "youtube_url": url})
+    return valid, invalid
+
+
+async def import_trends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start /import_trends — stores awaiting flag in DB."""
+    print("[IMPORT_TRENDS_START] command received", flush=True)
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    user_id = update.effective_user.id
+    from agents.db import execute
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"import_trends_awaiting_{user_id}", "true")
+    )
+    await update.message.reply_text(
+        "📥 Trend Import Mode\n\n"
+        "Paste trending songs in this format:\n\n"
+        "Song Name 1 | https://youtube.com/watch?v=abc\n"
+        "Song Name 2 | https://youtube.com/watch?v=def\n"
+        "Song Name 3 | https://youtube.com/watch?v=ghi\n\n"
+        "These will be saved as trends for /daily_report and Approve workflow."
+    )
+
+
+async def handle_import_trends_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text when user is in import_trends mode. Webhook-safe via DB."""
+    print("[IMPORT_TRENDS_RECEIVED] text handler triggered", flush=True)
+    if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_user.id
+    from agents.db import fetchone, execute
+    awaiting_row = fetchone(
+        "SELECT value FROM system_state WHERE key = ?",
+        (f"import_trends_awaiting_{user_id}",)
+    )
+    if not awaiting_row or awaiting_row.get("value") != "true":
+        print(f"[IMPORT_TRENDS_RECEIVED] user={user_id} not awaiting", flush=True)
+        return
+
+    text = update.message.text.strip()
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    valid, invalid = _parse_import_trend_lines(lines)
+    print(f"[IMPORT_TRENDS_PARSED] valid={len(valid)} invalid={len(invalid)}", flush=True)
+
+    # Clear awaiting flag
+    execute("DELETE FROM system_state WHERE key = ?", (f"import_trends_awaiting_{user_id}",))
+
+    if not valid:
+        await update.message.reply_text("❌ No valid trends found. Check format and try again.")
+        return
+
+    # Store session for confirm
+    session_id = _store_import_trends_session(user_id, valid)
+
+    summary = (
+        f"📊 Trend Import Summary\n\n"
+        f"Total lines: {len(lines)}\n"
+        f"✅ Valid: {len(valid)}\n"
+        f"❌ Invalid: {len(invalid)}\n\n"
+        f"Valid trends:\n"
+    )
+    for i, item in enumerate(valid[:10], 1):
+        summary += f"{i}. {item['song_name']}\n"
+    if len(valid) > 10:
+        summary += f"... and {len(valid) - 10} more\n"
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Save To Trends", callback_data=f"import_confirm_{session_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"import_cancel_{session_id}")],
+    ]
+    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def import_trends_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save imported trends to database."""
+    print("[IMPORT_TRENDS_SAVE] confirm callback", flush=True)
+    query = update.callback_query
+    await query.answer()
+
+    callback_data = query.data or ""
+    session_id = callback_data.replace("import_confirm_", "")
+    user_id = update.effective_user.id
+    session = _load_import_trends_session(user_id, session_id)
+    if not session:
+        await query.edit_message_text("❌ Session expired. Send /import_trends again.")
+        return
+
+    trends = session.get("trends", [])
+    if not trends:
+        await query.edit_message_text("❌ No valid trends to save.")
+        return
+
+    from agents.db import execute
+    now = dt.datetime.now().isoformat()
+    saved = 0
+    for trend in trends:
+        try:
+            execute(
+                """INSERT INTO trends (song_name, artist, youtube_url, source_platform, viral_score, growth_score, competition_score, opportunity_score, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    trend["song_name"],
+                    "",
+                    trend["youtube_url"],
+                    "agentreach",
+                    50.0,  # default viral_score
+                    50.0,  # default growth_score
+                    30.0,  # default competition_score
+                    60.0,  # default opportunity_score
+                    now,
+                )
+            )
+            saved += 1
+        except Exception as exc:
+            print(f"[IMPORT_TRENDS_SAVE] failed to save {trend['song_name']}: {exc}", flush=True)
+
+    print(f"[IMPORT_TRENDS_SAVE] saved={saved}", flush=True)
+    await query.edit_message_text(
+        f"✅ {saved} trends saved to database!\n\n"
+        f"Use /daily_report to view and approve them.\n"
+        f"Use /queue_status to check upload queue."
+    )
+
+
+async def import_trends_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel import trends."""
+    query = update.callback_query
+    await query.answer()
+    callback_data = query.data or ""
+    session_id = callback_data.replace("import_cancel_", "")
+    user_id = update.effective_user.id
+    _load_import_trends_session(user_id, session_id)
+    await query.edit_message_text("❌ Trend import cancelled.")
+
+
+async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    summary = get_summary()
+    paused = is_paused()
+    status_icon = "⏸️" if paused else "▶️"
+
+    text = (
+        f"{status_icon} Upload Queue Status\n\n"
+        f"Total: {summary['total']}\n"
+        f"⏳ Pending: {summary['pending']}\n"
+        f"🔄 Processing: {summary['processing']}\n"
+        f"✅ Completed: {summary['completed']}\n"
+        f"❌ Failed: {summary['failed']}\n"
+        f"🚫 Cancelled: {summary['cancelled']}\n\n"
+    )
+
+    if summary['pending'] > 0:
+        items = get_queue(status="pending", limit=5)
+        text += "Next up:\n"
+        for item in items:
+            text += f"  • {item['song_name'][:40]}\n"
+
+    await update.message.reply_text(text)
+
+
+async def queue_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    set_paused(True)
+    await update.message.reply_text("⏸️ Queue paused. Current song will finish, then processing stops.")
+
+
+async def queue_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    set_paused(False)
+    await update.message.reply_text("▶️ Queue resumed. Processing will continue shortly.")
+
+
+async def queue_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    count = cancel_all_pending()
+    await update.message.reply_text(f"🚫 Cancelled {count} pending item(s) from the queue.")
+
+
+
+
+# ==================== OUTRO CONVERSATION FLOW ====================
+
+# ==================== OUTRO SINGLE-SHOT (WEBHOOK-SAFE) ====================
+
+async def outro_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start /outro_add conversation. Ask for video file."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.message:
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "📤 Outro Upload\n\n"
+        "Send your outro video as a Telegram video or document (MP4/MOV).\n"
+        "Max size: 500MB"
+    )
+    return WAITING_OUTRO_VIDEO
+
+
+async def receive_outro_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive outro video file."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.message:
+        return ConversationHandler.END
+
+    file_id = None
+    file_unique_id = None
+    ext = ".mp4"
+
+    if update.message.video:
+        file_id = update.message.video.file_id
+        file_unique_id = update.message.video.file_unique_id
+        ext = ".mp4"
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        file_unique_id = update.message.document.file_unique_id
+        name = update.message.document.file_name or "outro.mp4"
+        ext = Path(name).suffix or ".mp4"
+        mime = update.message.document.mime_type or ""
+        if not (ext in {".mp4", ".mov", ".mkv", ".webm"} or mime.startswith("video/")):
+            await update.message.reply_text("Please send a video file (MP4/MOV/MKV/WEBM).")
+            return WAITING_OUTRO_VIDEO
+    else:
+        await update.message.reply_text("Please send a video file.")
+        return WAITING_OUTRO_VIDEO
+
+    # Check file size (500MB max)
+    file_size = 0
+    if update.message.video:
+        file_size = update.message.video.file_size or 0
+    elif update.message.document:
+        file_size = update.message.document.file_size or 0
+    if file_size > 500 * 1024 * 1024:
+        await update.message.reply_text("❌ File too large. Maximum 500MB allowed.")
+        return ConversationHandler.END
+
+    context.user_data["outro_file_id"] = file_id
+    context.user_data["outro_file_unique_id"] = file_unique_id
+    context.user_data["outro_ext"] = ext
+
+    await update.message.reply_text(
+        "✅ Video received.\n\n"
+        "What name should I save this outro as?\n"
+        "Example: Summer Outro"
+    )
+    return WAITING_OUTRO_NAME
+
+
+async def receive_outro_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive outro name."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    name = (update.message.text or "").strip()
+    if not name:
+        await update.message.reply_text("Please enter a name.")
+        return WAITING_OUTRO_NAME
+
+    context.user_data["outro_name"] = name
+    await update.message.reply_text(
+        f"Got it: '{name}'\n\n"
+        "What weight for selection? (1-100)\n"
+        "Higher = more frequently selected.\n"
+        "Default: 10"
+    )
+    return WAITING_OUTRO_WEIGHT
+
+
+async def receive_outro_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive outro weight and save to database."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    try:
+        weight = int(update.message.text or "10")
+        if weight < 1 or weight > 100:
+            raise ValueError("Weight must be 1-100")
+    except ValueError:
+        await update.message.reply_text("Please enter a number between 1 and 100.")
+        return WAITING_OUTRO_WEIGHT
+
+    outro_id = add_outro(
+        name=context.user_data["outro_name"],
+        file_id=context.user_data["outro_file_id"],
+        ext=context.user_data["outro_ext"],
+        weight=weight,
+        file_unique_id=context.user_data.get("outro_file_unique_id"),
+    )
+
+    from agents.db import is_using_postgres
+    ephemeral_warning = ""
+    if not is_using_postgres():
+        ephemeral_warning = "\n\n⚠️ WARNING: SQLite ephemeral storage active. Outros will be lost when Render restarts. Add DATABASE_URL env var for persistence."
+    await update.message.reply_text(
+        f"✅ Outro added!\n\n"
+        f"ID: {outro_id}\n"
+        f"Name: {context.user_data['outro_name']}\n"
+        f"Weight: {weight}\n"
+        f"Ext: {context.user_data['outro_ext']}\n\n"
+        f"Total active outros: {len(list_outros())}"
+        f"{ephemeral_warning}"
+    )
+    return ConversationHandler.END
+
+
+async def outro_add_single_shot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe single-shot outro upload.
+    
+    Usage: Send a video/document with caption:
+      /outro_add My Outro Name 10
+    Or reply to a video with:
+      /outro_add My Outro Name 10
+    """
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    # Try to get video from message or replied message
+    target_msg = update.message
+    if update.message.reply_to_message:
+        target_msg = update.message.reply_to_message
+
+    file_id = None
+    file_unique_id = None
+    ext = ".mp4"
+    file_size = 0
+
+    if target_msg.video:
+        file_id = target_msg.video.file_id
+        file_unique_id = target_msg.video.file_unique_id
+        ext = ".mp4"
+        file_size = target_msg.video.file_size or 0
+    elif target_msg.document:
+        file_id = target_msg.document.file_id
+        file_unique_id = target_msg.document.file_unique_id
+        name = target_msg.document.file_name or "outro.mp4"
+        ext = Path(name).suffix or ".mp4"
+        mime = target_msg.document.mime_type or ""
+        file_size = target_msg.document.file_size or 0
+        if not (ext in {".mp4", ".mov", ".mkv", ".webm"} or mime.startswith("video/")):
+            await update.message.reply_text("❌ Replied message is not a video file.")
+            return
+    else:
+        await update.message.reply_text(
+            "📤 Outro Upload (Webhook Mode)\n\n"
+            "Send a video with caption:\n"
+            "`/outro_add Outro Name 10`\n\n"
+            "Or reply to a video with:\n"
+            "`/outro_add Outro Name 10`"
+        )
+        return
+
+    if file_size > 500 * 1024 * 1024:
+        await update.message.reply_text("❌ File too large. Maximum 500MB allowed.")
+        return
+
+    # Parse name and weight from args
+    args = context.args or []
+    weight = 10
+    name = "Outro"
+    if args:
+        # Last arg might be weight
+        if len(args) > 1 and args[-1].isdigit():
+            weight = int(args[-1])
+            name = " ".join(args[:-1])
+        else:
+            name = " ".join(args)
+    else:
+        name = Path(target_msg.document.file_name if target_msg.document else "outro").stem or "Outro"
+
+    outro_id = add_outro(name=name, file_id=file_id, ext=ext, weight=weight, file_unique_id=file_unique_id)
+    from agents.db import is_using_postgres
+    ephemeral_warning = ""
+    if not is_using_postgres():
+        ephemeral_warning = "\n\n⚠️ WARNING: SQLite ephemeral storage active. Outros will be lost when Render restarts. Add DATABASE_URL env var for persistence."
+    await update.message.reply_text(
+        f"✅ Outro added!\n\n"
+        f"ID: {outro_id}\n"
+        f"Name: {name}\n"
+        f"Weight: {weight}\n"
+        f"File ID: `{file_id}`\n"
+        f"Ext: {ext}\n\n"
+        f"Total active outros: {len(list_outros())}"
+        f"{ephemeral_warning}"
+    )
+
+
+# ==================== AGENT REACH IMPORT (PHASE 2) ====================
+
+def _store_agentreach_session(user_id: int, candidates: list, invalid: list, duplicate: list, source: str = "text") -> str:
+    """Store agentreach session in DB for webhook-safe retrieval."""
+    import json, secrets
+    from agents.db import execute
+    session_id = secrets.token_urlsafe(16)
+    execute(
+        """INSERT INTO system_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (f"agentreach_{user_id}_{session_id}", json.dumps({
+            "candidates": candidates,
+            "invalid": invalid,
+            "duplicate": duplicate,
+            "source": source,
+            "created_at": dt.datetime.now().isoformat(),
+        }))
+    )
+    return session_id
+
+
+def _load_agentreach_session(user_id: int, session_id: str) -> dict | None:
+    import json
+    from agents.db import fetchone, execute
+    row = fetchone("SELECT value FROM system_state WHERE key = ?", (f"agentreach_{user_id}_{session_id}",))
+    if not row:
+        return None
+    execute("DELETE FROM system_state WHERE key = ?", (f"agentreach_{user_id}_{session_id}",))
+    return json.loads(row["value"])
+
+
+def _parse_agentreach_lines(lines: list[str]) -> tuple[list[dict], list[dict], list[dict]]:
+    """Parse and validate Agent Reach lines.
+    
+    Returns: (valid_items, invalid_items, duplicate_items)
+    """
+    valid = []
+    invalid = []
+    duplicate = []
+    seen_urls = set()
+    seen_names = set()
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if "|" not in line:
+            invalid.append({"line": line, "reason": "Missing | separator"})
+            continue
+        parts = [p.strip() for p in line.split("|", 1)]
+        song_name = parts[0]
+        url = extract_youtube_url(parts[1]) if len(parts) > 1 else None
+
+        if not song_name:
+            invalid.append({"line": line, "reason": "Missing song name"})
+            continue
+        if not url:
+            invalid.append({"line": line, "reason": "Invalid or missing YouTube URL"})
+            continue
+        if url in seen_urls:
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate URL in batch"})
+            continue
+        if song_name.lower() in seen_names:
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Duplicate song name in batch"})
+            continue
+        if is_already_uploaded(url):
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Already uploaded"})
+            continue
+        # Check if already in queue (pending/processing)
+        existing = fetchone(
+            "SELECT id FROM upload_queue WHERE youtube_url = ? AND status IN ('pending', 'processing') LIMIT 1",
+            (url,)
+        )
+        if existing:
+            duplicate.append({"song_name": song_name, "youtube_url": url, "reason": "Already in queue"})
+            continue
+
+        seen_urls.add(url)
+        seen_names.add(song_name.lower())
+        valid.append({"song_name": song_name, "youtube_url": url})
+
+    return valid, invalid, duplicate
+
+
+def _format_agentreach_summary(valid: list, invalid: list, duplicate: list, total_lines: int) -> str:
+    """Format the validation summary message."""
+    summary = (
+        f"📊 Agent Reach Summary\n\n"
+        f"📥 Total Songs: {total_lines}\n"
+        f"✅ Valid: {len(valid)}\n"
+        f"❌ Invalid: {len(invalid)}\n"
+        f"🔄 Duplicates: {len(duplicate)}\n\n"
+    )
+    if valid:
+        summary += "Valid songs:\n"
+        for i, item in enumerate(valid[:10], 1):
+            summary += f"{i}. {item['song_name']}\n"
+        if len(valid) > 10:
+            summary += f"... and {len(valid) - 10} more\n"
+    if invalid:
+        summary += "\n❌ Invalid entries:\n"
+        for item in invalid[:5]:
+            summary += f"• {item['line'][:40]}... ({item['reason']})\n"
+    if duplicate:
+        summary += "\n🔄 Duplicates:\n"
+        for item in duplicate[:5]:
+            summary += f"• {item['song_name'][:30]}... ({item['reason']})\n"
+    return summary
+
+
+async def agentreach_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start /agentreach command (Conversation mode for polling)."""
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.message:
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "📥 Agent Reach Import\n\n"
+        "Paste your song list in this format:\n\n"
+        "Song Name | https://youtube.com/watch?v=xxx\n"
+        "Song Name 2 | https://youtube.com/watch?v=yyy\n\n"
+        "One song per line. Use | to separate name and URL.\n"
+        "Maximum 100 songs.\n\n"
+        "Or send a CSV file with columns: song_name,youtube_url"
+    )
+    return WAITING_AGENTREACH
+
+
+async def handle_agentreach_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Parse Agent Reach pasted list (Conversation mode)."""
+    if not update.message or not update.message.text:
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    if len(lines) > 100:
+        await update.message.reply_text("❌ Too many songs. Maximum 100 allowed.")
+        return ConversationHandler.END
+
+    valid, invalid, duplicate = _parse_agentreach_lines(lines)
+
+    context.user_data["agentreach_candidates"] = valid
+    context.user_data["agentreach_invalid"] = invalid
+    context.user_data["agentreach_duplicate"] = duplicate
+
+    summary = _format_agentreach_summary(valid, invalid, duplicate, len(lines))
+    keyboard = [
+        [InlineKeyboardButton("✅ Add To Queue", callback_data="agentreach_confirm")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="agentreach_cancel")],
+    ]
+    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+    return ConversationHandler.END
+
+
+async def agentreach_single_shot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe /agentreach that parses text in one shot and stores session in DB.
+    
+    Supports:
+      /agentreach (shows instructions)
+      /agentreach Song 1 | https://...\nSong 2 | https://...
+      Plain text list (when used as general message handler)
+    """
+    try:
+        if await reject_if_unauthorized(update):
+            return
+        if not update.message or not update.message.text:
+            return
+
+        text = update.message.text.strip()
+        
+        # Strip /agentreach command prefix if present
+        if text.startswith("/agentreach"):
+            text = text[len("/agentreach"):].strip()
+        
+        if not text:
+            await update.message.reply_text(
+                "📥 Agent Reach Import\n\n"
+                "Send your song list in this format (same message as /agentreach):\n\n"
+                "/agentreach\n"
+                "Song Name 1 | https://youtube.com/watch?v=xxx\n"
+                "Song Name 2 | https://youtube.com/watch?v=yyy\n\n"
+                "Or paste the list directly after the command.\n"
+                "Maximum 100 songs.\n\n"
+                "You can also send a CSV file with columns: song_name,youtube_url"
+            )
+            return
+
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+        if len(lines) > 100:
+            await update.message.reply_text("❌ Too many songs. Maximum 100 allowed.")
+            return
+
+        valid, invalid, duplicate = _parse_agentreach_lines(lines)
+        user_id = update.effective_user.id
+        session_id = _store_agentreach_session(user_id, valid, invalid, duplicate, source="text")
+
+        summary = _format_agentreach_summary(valid, invalid, duplicate, len(lines))
+        keyboard = [
+            [InlineKeyboardButton("✅ Add To Queue", callback_data=f"ar_confirm_{session_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"ar_cancel_{session_id}")],
+        ]
+        await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as exc:
+        import traceback
+        error_msg = f"❌ Agent Reach error:\n{exc}\n\n{traceback.format_exc()[:500]}"
+        if update.message:
+            await update.message.reply_text(error_msg)
+        else:
+            print(error_msg, flush=True)
+
+
+async def agentreach_csv_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle CSV document upload for Agent Reach."""
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message or not update.message.document:
+        return
+
+    doc = update.message.document
+    name = doc.file_name or ""
+    if not name.lower().endswith(".csv"):
+        await update.message.reply_text("❌ Please send a CSV file (.csv extension).")
+        return
+
+    # Download CSV
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        csv_path = TELEGRAM_DOWNLOADS_DIR / f"agentreach_{doc.file_id}.csv"
+        await tg_file.download_to_drive(custom_path=str(csv_path))
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Failed to download CSV: {exc}")
+        return
+
+    # Parse CSV
+    import csv
+    lines = []
+    try:
+        with csv_path.open("r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) >= 2:
+                    song_name = row[0].strip()
+                    url = row[1].strip()
+                    lines.append(f"{song_name} | {url}")
+                elif len(row) == 1 and row[0].strip():
+                    # Maybe tab-separated or malformed
+                    lines.append(row[0].strip())
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Failed to parse CSV: {exc}")
+        return
+    finally:
+        csv_path.unlink(missing_ok=True)
+
+    if len(lines) > 100:
+        await update.message.reply_text("❌ Too many songs in CSV. Maximum 100 allowed.")
+        return
+
+    valid, invalid, duplicate = _parse_agentreach_lines(lines)
+    user_id = update.effective_user.id
+    session_id = _store_agentreach_session(user_id, valid, invalid, duplicate, source="csv")
+
+    summary = _format_agentreach_summary(valid, invalid, duplicate, len(lines))
+    keyboard = [
+        [InlineKeyboardButton("✅ Add To Queue", callback_data=f"ar_confirm_{session_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"ar_cancel_{session_id}")],
+    ]
+    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ── Callbacks ──
+
+async def agentreach_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Legacy polling-mode confirm."""
+    query = update.callback_query
+    await query.answer()
+
+    candidates = context.user_data.get("agentreach_candidates", [])
+    if not candidates:
+        await query.edit_message_text("❌ No valid songs to add. Send /agentreach again.")
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    result = add_multiple_items_transactional(user_id, chat_id, candidates, source="agentreach")
+
+    context.user_data.pop("agentreach_candidates", None)
+    context.user_data.pop("agentreach_invalid", None)
+    context.user_data.pop("agentreach_duplicate", None)
+
+    if result["success"]:
+        msg = (
+            f"✅ {result['added_count']} songs added to upload queue!\n\n"
+            f"⏳ Pending Count: {result['pending_total']}\n"
+            f"📦 Queue IDs: {', '.join(str(i) for i in result['added_ids'][:5])}"
+            f"{'...' if len(result['added_ids']) > 5 else ''}\n\n"
+            f"Use /queue_status to check progress."
+        )
+    else:
+        msg = f"❌ Batch failed:\n{result.get('error', 'Unknown error')}\n\nNo items were added."
+    await query.edit_message_text(msg)
+
+
+async def agentreach_db_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe confirm using DB session + transactional insert."""
+    try:
+        query = update.callback_query
+        await query.answer()
+
+        callback_data = query.data or ""
+        session_id = callback_data.replace("ar_confirm_", "")
+        user_id = update.effective_user.id
+        session = _load_agentreach_session(user_id, session_id)
+        if not session:
+            await query.edit_message_text("❌ Session expired. Send /agentreach again.")
+            return
+
+        candidates = session.get("candidates", [])
+        if not candidates:
+            await query.edit_message_text("❌ No valid songs to add.")
+            return
+
+        chat_id = update.effective_chat.id
+        result = add_multiple_items_transactional(user_id, chat_id, candidates, source="agentreach")
+
+        if result["success"]:
+            msg = (
+                f"✅ {result['added_count']} songs added to upload queue!\n\n"
+                f"⏳ Pending Count: {result['pending_total']}\n"
+                f"📦 Queue IDs: {', '.join(str(i) for i in result['added_ids'][:5])}"
+                f"{'...' if len(result['added_ids']) > 5 else ''}\n\n"
+                f"Use /queue_status to check progress."
+            )
+        else:
+            msg = f"❌ Batch failed:\n{result.get('error', 'Unknown error')}\n\nNo items were added."
+        await query.edit_message_text(msg)
+    except Exception as exc:
+        import traceback
+        error_msg = f"❌ Confirm error:\n{exc}\n\n{traceback.format_exc()[:500]}"
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.message.reply_text(error_msg)
+        print(error_msg, flush=True)
+
+
+async def agentreach_db_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Webhook-safe cancel using DB session."""
+    query = update.callback_query
+    await query.answer()
+    callback_data = query.data or ""
+    session_id = callback_data.replace("ar_cancel_", "")
+    user_id = update.effective_user.id
+    _load_agentreach_session(user_id, session_id)
+    await query.edit_message_text("❌ Agent Reach import cancelled.")
+
+
+async def agentreach_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Legacy polling-mode cancel."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("agentreach_candidates", None)
+    context.user_data.pop("agentreach_invalid", None)
+    context.user_data.pop("agentreach_duplicate", None)
+    await query.edit_message_text("❌ Agent Reach import cancelled.")
+
+
+# ==================== QUEUE COMMANDS ====================
+
+async def queue_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    summary = get_summary()
+    paused = is_paused()
+    status_icon = "⏸️" if paused else "▶️"
+
+    text = (
+        f"{status_icon} Upload Queue Status\n\n"
+        f"Total: {summary['total']}\n"
+        f"⏳ Pending: {summary['pending']}\n"
+        f"🔄 Processing: {summary['processing']}\n"
+        f"✅ Completed: {summary['completed']}\n"
+        f"❌ Failed: {summary['failed']}\n"
+        f"🚫 Cancelled: {summary['cancelled']}\n\n"
+    )
+
+    if summary['pending'] > 0:
+        items = get_queue(status="pending", limit=5)
+        text += "Next up:\n"
+        for item in items:
+            text += f"  • {item['song_name'][:40]}\n"
+
+    await update.message.reply_text(text)
+
+
+async def queue_pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    set_paused(True)
+    await update.message.reply_text("⏸️ Queue paused. Current song will finish, then processing stops.")
+
+
+async def queue_resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    set_paused(False)
+    await update.message.reply_text("▶️ Queue resumed. Processing will continue shortly.")
+
+
+async def queue_cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    count = cancel_all_pending()
+    await update.message.reply_text(f"🚫 Cancelled {count} pending item(s) from the queue.")
+
+
+async def worker_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show status of recent GitHub worker jobs."""
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+
+    from agents.db import fetchall
+    jobs = fetchall(
+        """SELECT job_id, song_name, status, stage, error_message, dispatched_at, updated_at
+           FROM github_jobs ORDER BY dispatched_at DESC LIMIT 10"""
+    )
+
+    if not jobs:
+        await update.message.reply_text(
+            "🚀 GitHub Worker Status\n\n"
+            "No jobs tracked yet.\n\n"
+            "Jobs will appear here after you approve a trend or bulk upload."
+        )
+        return
+
+    lines = ["🚀 GitHub Worker Status (Last 10 Jobs)\n"]
+    status_icons = {
+        "dispatched": "📤",
+        "downloading": "⬇️",
+        "rendering": "🎬",
+        "uploading": "📤",
+        "completed": "✅",
+        "failed": "❌",
+    }
+
+    for job in jobs:
+        icon = status_icons.get(job["status"], "❓")
+        song = job["song_name"][:30]
+        status = job["status"]
+        stage = job["stage"]
+        error = job["error_message"]
+        dispatched = job["dispatched_at"][:16] if job["dispatched_at"] else "?"
+
+        lines.append(f"{icon} {song}")
+        lines.append(f"   Status: {status} | Stage: {stage}")
+        if error:
+            lines.append(f"   Error: {error[:60]}")
+        lines.append(f"   Time: {dispatched}")
+        lines.append("")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def github_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -382,8 +1620,11 @@ async def github_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as exc:
         await update.message.reply_text(f"❌ GitHub test error:\n{exc}")
 
-
 async def export_youtube_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the user's YouTube OAuth token JSON for adding to GitHub Actions secrets.
+
+    Owner-only if AUTHORIZED_TELEGRAM_USER_ID is set. Treat this as highly sensitive.
+    """
     if await reject_if_unauthorized(update):
         return
     if not update.effective_user or not update.message:
@@ -403,7 +1644,6 @@ async def export_youtube_token(update: Update, context: ContextTypes.DEFAULT_TYP
         caption="GitHub Secret me value ke andar is file ka full content paste karo."
     )
 
-
 async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_if_unauthorized(update):
         return
@@ -411,8 +1651,13 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not GOOGLE_CLIENT_SECRETS_PATH.exists():
         await update.message.reply_text(
-            "Google OAuth config missing. Hosting env me GOOGLE_CLIENT_SECRETS_JSON add karo "
-            "ya client_secrets.json file deploy karo."
+            "❌ Google OAuth config missing.\n\n"
+            "Add this to Render Environment Variables:\n"
+            "Name: GOOGLE_CLIENT_SECRETS_JSON\n"
+            "Value: Your Google Cloud OAuth 2.0 client JSON\n\n"
+            "Expected format:\n"
+            '{"web":{"client_id":"...","client_secret":"...","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token"}}\n\n'
+            "Or upload client_secrets.json to the repo root."
         )
         return
     if not BASE_URL:
@@ -420,6 +1665,8 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state = secrets.token_urlsafe(24)
+    # PKCE needs the same code_verifier during callback. If we don't keep it,
+    # Google returns: invalid_grant Missing code verifier.
     code_verifier = secrets.token_urlsafe(64)
     OAUTH_STATES[state] = {"user_id": update.effective_user.id, "code_verifier": code_verifier}
     flow = make_flow(state=state, code_verifier=code_verifier)
@@ -438,6 +1685,129 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @flask_app.route("/")
 def home():
     return "YouTube Song Telegram Bot is running. Open Telegram and use /start."
+
+
+def _get_commit_hash() -> str:
+    import subprocess, os
+    env_hash = os.environ.get("RENDER_GIT_COMMIT", "").strip()
+    if env_hash:
+        return env_hash[:7]
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
+
+
+def _diag_webhook_status() -> dict[str, Any]:
+    """Live Telegram webhook state WITHOUT exposing secrets.
+
+    Never prints the webhook URL (it embeds WEBHOOK_SECRET) or the token.
+    Reports only booleans/counters plus the secret-redacted last error.
+    """
+    result: dict[str, Any] = {"check": "unavailable"}
+    try:
+        if telegram_app is None or BOT_LOOP is None:
+            result["reason"] = "bot not started yet"
+            return result
+        fut = asyncio.run_coroutine_threadsafe(
+            telegram_app.bot.get_webhook_info(), BOT_LOOP
+        )
+        info = fut.result(timeout=10)
+        url = info.url or ""
+        result = {
+            "check": "ok",
+            "webhook_set": bool(url),
+            "matches_base_url": bool(BASE_URL) and url.startswith(BASE_URL),
+            "pending_update_count": info.pending_update_count,
+            "last_error_date": info.last_error_date,
+            "last_error_message": (info.last_error_message or "").replace(
+                WEBHOOK_SECRET, "***")[:300],
+            "last_synchronization_error_date": info.last_synchronization_error_date,
+        }
+    except Exception as exc:
+        result = {"check": "error", "error": str(exc)[:200]}
+    return result
+
+
+@flask_app.route("/diag")
+def diag():
+    """Production diagnostic endpoint. Returns trend engine, outro, and queue status.
+
+    Trend tables (two sources, different writers):
+      - `trends`: user-imported via /import_trends + /seed_trends; feeds
+        /daily_report and the approve_trend_<id> workflow.
+      - `viral_trends`: auto-discovery cache written by refresh_trends()
+        (wiped + rewritten on every refresh), feeds /trend_debug.
+    """
+    from agents.viral_trend_engine import _yt_dlp_version, get_viral_trends, DB_PATH
+    from agents.outro_manager import list_outros, get_last_used_outro_ids
+    from agents.queue_engine import get_summary, is_paused
+    from agents.db import fetchall
+    from pathlib import Path
+    db_exists = Path(DB_PATH).exists()
+    trends = get_viral_trends(5)
+    imported_trends = fetchall(
+        "SELECT id, song_name, artist, youtube_url, source_platform, opportunity_score "
+        "FROM trends ORDER BY opportunity_score DESC LIMIT 5"
+    )
+    outros = list_outros()
+    last_used = get_last_used_outro_ids(3)
+    queue_summary = get_summary()
+    return {
+        "status": "ok",
+        "commit": _get_commit_hash(),
+        "yt_dlp_version": _yt_dlp_version(),
+        "db_path": DB_PATH,
+        "db_exists": db_exists,
+        "db_trend_count": len(trends),
+        "trends": [
+            {"song": t[0], "artist": t[1], "platform": t[2], "url": t[3],
+             "viral": t[4], "growth": t[5], "competition": t[6], "opportunity": t[7]}
+            for t in trends
+        ],
+        "trends_imported_count": len(imported_trends),
+        "trends_imported": [
+            {"id": t["id"], "song": t["song_name"], "artist": t["artist"],
+             "url": t["youtube_url"], "platform": t["source_platform"],
+             "opportunity": t["opportunity_score"]}
+            for t in imported_trends
+        ],
+        "outros": {
+            "count": len(outros),
+            "last_used_ids": last_used,
+            "items": [{"id": o.id, "name": o.name, "weight": o.weight} for o in outros],
+        },
+        "queue": {
+            "paused": is_paused(),
+            **queue_summary,
+        },
+        "feature_flags": {
+            "ENABLE_TREND_AGENT": ENABLE_TREND_AGENT,
+            "ENABLE_RECOMMENDATIONS": ENABLE_RECOMMENDATIONS,
+            "ENABLE_APPROVE_WORKFLOW": ENABLE_APPROVE_WORKFLOW,
+            "ENABLE_AGENTREACH_IMPORT": ENABLE_AGENTREACH_IMPORT,
+            "ENABLE_OUTRO_ROTATION_V2": ENABLE_OUTRO_ROTATION_V2,
+            "ENABLE_DASHBOARD": ENABLE_DASHBOARD,
+            "ENABLE_SYSTEM_HEALTH": ENABLE_SYSTEM_HEALTH,
+        },
+        "github_worker": USE_GITHUB_WORKER,
+        "github_repo": normalize_github_repo(GITHUB_REPO) if GITHUB_REPO else None,
+        "commands": sorted(KNOWN_COMMANDS),
+        "webhook": _diag_webhook_status(),
+    }
+
+
+@flask_app.route("/raw")
+def raw():
+    """Temporary raw data dump for audit."""
+    from agents.db import fetchall
+    try:
+        outros = fetchall("SELECT id, name, file_id, weight, is_active, added_at FROM outros WHERE is_active = 1 ORDER BY id")
+        history = fetchall("SELECT id, outro_id, upload_id, used_at FROM outro_history ORDER BY used_at DESC LIMIT 10")
+        trends = fetchall("SELECT song_name, artist, platform, source_url, opportunity_score FROM viral_trends ORDER BY opportunity_score DESC LIMIT 3")
+        return {"outros": outros, "history": history, "trends": trends}
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 @flask_app.route(f"/telegram/{WEBHOOK_SECRET}", methods=["POST"])
@@ -464,6 +1834,8 @@ def oauth2callback():
     code_verifier = state_data.get("code_verifier")
     try:
         flow = make_flow(state=state, code_verifier=code_verifier)
+        # Some hosts pass the callback to Flask as http internally even though the public URL is https.
+        # OAuth requires https, so rebuild the callback from BASE_URL.
         authorization_response = f"{BASE_URL}/oauth2callback"
         if request.query_string:
             authorization_response += "?" + request.query_string.decode("utf-8")
@@ -485,6 +1857,8 @@ def oauth2callback():
         return f"OAuth failed: {exc}", 500
 
 
+
+
 def parse_tags_text(raw: str | None) -> list[str] | None:
     if not raw:
         return None
@@ -493,6 +1867,18 @@ def parse_tags_text(raw: str | None) -> list[str] | None:
 
 
 def parse_quick_details(text: str) -> dict[str, Any]:
+    """Parse optional one-message metadata.
+
+    Supported formats:
+      Title: My Song
+      Artist: Artist Name
+      YouTube: https://...
+      YT Title: Custom upload title
+      Description: custom desc
+      Tags: tag1, tag2
+
+    Also supports one-line: My Song | Artist Name | https://youtu.be/...
+    """
     data: dict[str, Any] = {}
     raw = (text or "").strip()
     if not raw:
@@ -533,6 +1919,7 @@ def parse_quick_details(text: str) -> dict[str, Any]:
         if len(parts) > 2 and extract_youtube_url(parts[2]):
             data["youtube_url"] = extract_youtube_url(parts[2])
     elif not data:
+        # Treat plain text as title if no URL.
         if not url:
             data["song_name"] = raw
     if data.get("custom_tags_raw"):
@@ -541,8 +1928,17 @@ def parse_quick_details(text: str) -> dict[str, Any]:
 
 
 async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """If all required inputs are present, dispatch GitHub worker."""
     data = context.user_data
     has_source = data.get("source_type") == "youtube_url" or bool(data.get("audio_file_id"))
+
+    # Auto-select outro if not provided
+    if not data.get("outro_file_id"):
+        outro = select_outro()
+        if outro:
+            data["outro_file_id"] = outro["file_id"]
+            data["outro_ext"] = outro["ext"]
+
     if not (data.get("song_name") and has_source and data.get("outro_file_id")):
         missing = []
         if not data.get("song_name"):
@@ -550,7 +1946,7 @@ async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_
         if not has_source:
             missing.append("audio file ya YouTube link")
         if not data.get("outro_file_id"):
-            missing.append("outro video")
+            missing.append("outro video (use /outro_add first)")
         await update.message.reply_text("Abhi missing hai: " + ", ".join(missing))
         return False
 
@@ -577,6 +1973,7 @@ async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_
         "custom_description": data.get("custom_description"),
         "custom_tags": data.get("custom_tags"),
     }
+    # Save a fallback job so /audio_retry can reuse all details if YouTube link fails.
     PENDING_RETRY_JOBS[user_id] = payload.copy()
     if USE_GITHUB_WORKER:
         await asyncio.to_thread(dispatch_github_worker, payload)
@@ -586,8 +1983,1042 @@ async def maybe_dispatch_if_ready(update: Update, context: ContextTypes.DEFAULT_
     context.user_data.clear()
     return True
 
+async def new_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+    if not token_file_for_user(update.effective_user.id).exists():
+        await update.message.reply_text("Pehle /auth bhej ke YouTube channel connect karo.")
+        return ConversationHandler.END
 
-# ==================== build_telegram_app ====================
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Naya video start ✅\n\n"
+        "Tum sab details ek message me bhej sakte ho, example:\n\n"
+        "Title: Pieces of You\n"
+        "Artist: Vedansh Jain\n"
+        "YouTube: https://youtu.be/...   optional\n"
+        "YT Title: custom upload title   optional\n"
+        "Description: custom description optional\n"
+        "Tags: tag1, tag2, tag3 optional\n\n"
+        "Ya simple song title bhejo. Ab files bhi kisi bhi order me bhej sakte ho — thumbnail/audio/outro pehle bhi chalega. Jo missing hoga bot bata dega."
+    )
+    return WAITING_TITLE
+
+
+async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    details = parse_quick_details(update.message.text or "")
+    context.user_data.update(details)
+    if details.get("youtube_url"):
+        context.user_data["source_type"] = "youtube_url"
+
+    if not context.user_data.get("song_name"):
+        await update.message.reply_text("Proper song title bhejo.")
+        return WAITING_TITLE
+
+    await update.message.reply_text(
+        "Details saved ✅\n\n"
+        "Ab tum ye files kisi bhi order me bhej sakte ho:\n"
+        "1. Exact thumbnail image jo video/poster me use hogi\n"
+        "2. Audio file MP3/M4A agar YouTube link nahi diya\n"
+        "3. Outro video\n\n"
+        "Jab required cheezein mil jayengi, bot khud GitHub worker start kar dega.\n"
+        "Agar artist add/replace karna ho: Artist: name bhej do."
+    )
+    return WAITING_LINK
+
+async def receive_artist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    artist = (update.message.text or "").strip()
+    context.user_data["artist"] = artist
+    await update.message.reply_text(
+        "Ab thumbnail ke liye reference image/photo bhejo.\n\n"
+        "Ye image poster me use hogi aur uske upar attractive text design banega.\n"
+        "Agar reference nahi dena to /skip bhejo."
+    )
+    return WAITING_REFERENCE
+
+
+async def skip_artist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    context.user_data["artist"] = None
+    await update.message.reply_text(
+        "Ab thumbnail ke liye reference image/photo bhejo. Agar reference nahi dena to /skip bhejo."
+    )
+    return WAITING_REFERENCE
+
+
+async def receive_reference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+
+    ref_file_id = None
+    ext = ".jpg"
+    if update.message.photo:
+        ref_file_id = update.message.photo[-1].file_id
+        ext = ".jpg"
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        ref_file_id = update.message.document.file_id
+        ext = Path(update.message.document.file_name or "reference.jpg").suffix or ".jpg"
+    else:
+        await update.message.reply_text("Please image/photo bhejo, ya /skip bhejo.")
+        return WAITING_REFERENCE
+
+    context.user_data["reference_file_id"] = ref_file_id
+    context.user_data["reference_ext"] = ext
+    await ask_audio_source(update)
+    return WAITING_LINK
+
+
+async def skip_reference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    context.user_data["reference_file_id"] = None
+    await ask_audio_source(update)
+    return WAITING_LINK
+
+
+async def ask_audio_source(update: Update) -> None:
+    await update.message.reply_text(
+        "Ab song audio source bhejo:\n\n"
+        "Option 1: Licensed MP3/M4A audio file bhejo — recommended.\n"
+        "Option 2: YouTube link bhejo — kabhi-kabhi cloud par block ho sakta hai.\n\n"
+        "Example link:\nhttps://www.youtube.com/watch?v=VIDEO_ID"
+    )
+
+
+async def collect_asset_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    msg = update.message
+
+    if msg.text:
+        details = parse_quick_details(msg.text)
+        if details:
+            context.user_data.update(details)
+            if details.get("youtube_url"):
+                context.user_data["source_type"] = "youtube_url"
+            await update.message.reply_text("Text details/link saved ✅")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    # Photo/image = exact thumbnail now (not reference template)
+    if msg.photo:
+        context.user_data["thumbnail_file_id"] = msg.photo[-1].file_id
+        context.user_data["thumbnail_ext"] = ".jpg"
+        await update.message.reply_text("Exact thumbnail saved ✅ Yehi poster/video thumbnail use hoga.")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    if msg.audio:
+        context.user_data["source_type"] = "telegram_audio"
+        context.user_data["audio_file_id"] = msg.audio.file_id
+        context.user_data["audio_ext"] = Path(msg.audio.file_name or "song.mp3").suffix or ".mp3"
+        if not context.user_data.get("song_name"):
+            context.user_data["song_name"] = msg.audio.title or Path(msg.audio.file_name or "Song").stem
+        await update.message.reply_text("Audio file saved ✅")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    if msg.video:
+        context.user_data["outro_file_id"] = msg.video.file_id
+        context.user_data["outro_ext"] = ".mp4"
+        # Auto-save outro to DB so user doesn't have to re-upload
+        try:
+            add_outro(
+                name="Auto-saved Outro",
+                file_id=msg.video.file_id,
+                ext=".mp4",
+                weight=10,
+                file_unique_id=msg.video.file_unique_id,
+            )
+        except Exception as e:
+            print(f"[OUTRO_AUTO_SAVE] failed: {e}", flush=True)
+        await update.message.reply_text("Outro video saved ✅")
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    if msg.document:
+        name = msg.document.file_name or "file"
+        ext = Path(name).suffix.lower()
+        mime = msg.document.mime_type or ""
+        if mime.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp"}:
+            context.user_data["thumbnail_file_id"] = msg.document.file_id
+            context.user_data["thumbnail_ext"] = ext or ".jpg"
+            await update.message.reply_text("Exact thumbnail image saved ✅")
+        elif ext in AUDIO_EXTS:
+            context.user_data["source_type"] = "telegram_audio"
+            context.user_data["audio_file_id"] = msg.document.file_id
+            context.user_data["audio_ext"] = ext or ".mp3"
+            if not context.user_data.get("song_name"):
+                context.user_data["song_name"] = Path(name).stem
+            await update.message.reply_text("Audio file saved ✅")
+        elif ext in {".mp4", ".mov", ".mkv", ".webm"} or mime.startswith("video/"):
+            context.user_data["outro_file_id"] = msg.document.file_id
+            context.user_data["outro_ext"] = ext or ".mp4"
+            # Auto-save outro to DB so user doesn't have to re-upload
+            try:
+                add_outro(
+                    name=Path(name).stem or "Auto-saved Outro",
+                    file_id=msg.document.file_id,
+                    ext=ext or ".mp4",
+                    weight=10,
+                    file_unique_id=msg.document.file_unique_id,
+                )
+            except Exception as e:
+                print(f"[OUTRO_AUTO_SAVE] failed: {e}", flush=True)
+            await update.message.reply_text("Outro video saved ✅")
+        else:
+            await update.message.reply_text("File type samajh nahi aaya. Image/audio/outro video bhejo.")
+            return WAITING_LINK
+        await maybe_dispatch_if_ready(update, context)
+        return WAITING_LINK
+
+    await update.message.reply_text("Please text details, thumbnail image, audio file, ya outro video bhejo.")
+    return WAITING_LINK
+
+async def receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+
+    # Source can be a YouTube link OR an uploaded audio file.
+    if update.message.text:
+        text = update.message.text or ""
+        url = extract_youtube_url(text)
+        if not url:
+            await update.message.reply_text(
+                "Valid YouTube link nahi mila. Ya to proper YouTube link bhejo, ya licensed MP3/M4A audio file bhejo."
+            )
+            return WAITING_LINK
+
+        detected_title = get_youtube_title(url) or context.user_data.get("song_name") or "YouTube Song"
+        context.user_data["source_type"] = "youtube_url"
+        context.user_data["youtube_url"] = url
+        context.user_data.setdefault("song_name", detected_title)
+        await update.message.reply_text(
+            f"Audio source set ho gaya. Title: {context.user_data['song_name']}\n\n"
+            "Ab apna 30–40 sec outro video bhejo as Telegram video/document."
+        )
+        return WAITING_OUTRO
+
+    tg_file_id = None
+    ext = ".mp3"
+    title = "Telegram Audio"
+
+    if update.message.audio:
+        tg_file_id = update.message.audio.file_id
+        title = update.message.audio.title or update.message.audio.file_name or "Telegram Audio"
+        ext = Path(update.message.audio.file_name or "song.mp3").suffix or ".mp3"
+    elif update.message.document:
+        name = update.message.document.file_name or "song.mp3"
+        ext = Path(name).suffix.lower() or ".mp3"
+        if ext not in AUDIO_EXTS:
+            await update.message.reply_text(
+                "Ye audio file nahi lag rahi. Please MP3/M4A/WAV/AAC/FLAC/OGG file bhejo, ya YouTube link bhejo."
+            )
+            return WAITING_LINK
+        tg_file_id = update.message.document.file_id
+        title = Path(name).stem or "Telegram Audio"
+    else:
+        await update.message.reply_text("Please YouTube link ya song audio file bhejo.")
+        return WAITING_LINK
+
+    context.user_data["source_type"] = "telegram_audio"
+    context.user_data["audio_file_id"] = tg_file_id
+    context.user_data["audio_ext"] = ext
+    context.user_data.setdefault("song_name", title)
+    await update.message.reply_text(
+        f"Audio mil gaya. Title: {context.user_data['song_name']}\n\n"
+        "Ab apna 30–40 sec outro video bhejo as Telegram video/document."
+    )
+    return WAITING_OUTRO
+
+async def receive_outro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+
+    tg_file_id = None
+    ext = ".mp4"
+    file_unique_id = None
+    if update.message.video:
+        tg_file_id = update.message.video.file_id
+        file_unique_id = update.message.video.file_unique_id
+        ext = ".mp4"
+    elif update.message.document:
+        tg_file_id = update.message.document.file_id
+        file_unique_id = update.message.document.file_unique_id
+        name = update.message.document.file_name or "outro.mp4"
+        ext = Path(name).suffix or ".mp4"
+    else:
+        await update.message.reply_text("Please outro video file bhejo, text/photo nahi.")
+        return WAITING_OUTRO
+
+    # Auto-save outro to DB so user doesn't have to re-upload via /outro_add
+    try:
+        add_outro(
+            name=Path(update.message.document.file_name or "outro").stem if update.message.document else "Auto-saved Outro",
+            file_id=tg_file_id,
+            ext=ext,
+            weight=10,
+            file_unique_id=file_unique_id,
+        )
+    except Exception as e:
+        print(f"[OUTRO_AUTO_SAVE] failed: {e}", flush=True)
+
+    await update.message.reply_text("Outro mil gaya. Ab video generate + upload start kar raha hoon. Thoda time lagega.")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO)
+
+    user_id = update.effective_user.id
+    source_type = context.user_data.get("source_type", "youtube_url")
+    youtube_url = context.user_data.get("youtube_url")
+    song_name = context.user_data["song_name"]
+    artist = context.user_data.get("artist")
+
+    try:
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = slugify(song_name)
+        job_dir = OUTPUTS_DIR / f"telegram-{user_id}-{base}-{stamp}"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        outro_path = job_dir / f"outro{ext}"
+        thumb_path = job_dir / "thumbnail.jpg"
+        video_path = job_dir / f"{base}.mp4"
+        workdir = job_dir / "work"
+
+        if USE_GITHUB_WORKER:
+            job_payload = {
+                "job_id": f"{user_id}-{stamp}",
+                "chat_id": update.effective_chat.id,
+                "user_id": user_id,
+                "song_name": song_name,
+                "artist": artist,
+                "source_type": source_type,
+                "youtube_url": youtube_url,
+                "audio_file_id": context.user_data.get("audio_file_id"),
+                "audio_ext": context.user_data.get("audio_ext", ".mp3"),
+                "thumbnail_file_id": context.user_data.get("thumbnail_file_id"),
+                "thumbnail_ext": context.user_data.get("thumbnail_ext", ".jpg"),
+                "reference_file_id": context.user_data.get("reference_file_id"),
+                "reference_ext": context.user_data.get("reference_ext", ".jpg"),
+                "custom_title": context.user_data.get("custom_title"),
+                "custom_description": context.user_data.get("custom_description"),
+                "custom_tags": context.user_data.get("custom_tags"),
+                "outro_file_id": tg_file_id,
+                "outro_ext": ext,
+                "privacy": DEFAULT_PRIVACY,
+            }
+            await asyncio.to_thread(dispatch_github_worker, job_payload)
+            await update.message.reply_text(
+                "🚀 Job GitHub Actions worker ko bhej diya.\n"
+                "Ab heavy 1080p/720p render GitHub par hoga. Status yahin Telegram par aayega."
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        tg_file = await context.bot.get_file(tg_file_id)
+        await tg_file.download_to_drive(custom_path=str(outro_path))
+
+        if source_type == "youtube_url":
+            await update.message.reply_text("Audio download kar raha hoon...")
+            audio_path = await asyncio.to_thread(download_youtube_audio, youtube_url, job_dir / "downloaded_audio")
+        else:
+            await update.message.reply_text("Audio file download kar raha hoon...")
+            audio_ext = context.user_data.get("audio_ext", ".mp3")
+            audio_path = job_dir / f"source_audio{audio_ext}"
+            audio_tg_file = await context.bot.get_file(context.user_data["audio_file_id"])
+            await audio_tg_file.download_to_drive(custom_path=str(audio_path))
+
+        await update.message.reply_text("Thumbnail aur video render kar raha hoon...")
+        ref_file_id = context.user_data.get("reference_file_id")
+        if ref_file_id:
+            ref_ext = context.user_data.get("reference_ext", ".jpg")
+            ref_path = job_dir / f"reference{ref_ext}"
+            ref_tg_file = await context.bot.get_file(ref_file_id)
+            await ref_tg_file.download_to_drive(custom_path=str(ref_path))
+            await asyncio.to_thread(generate_reference_thumbnail, song_name, artist, ref_path, thumb_path)
+        else:
+            await asyncio.to_thread(generate_thumbnail, song_name, artist, thumb_path)
+
+        await asyncio.to_thread(render_video, thumb_path, audio_path, outro_path, video_path, workdir)
+
+        metadata = generate_seo_metadata(song_name, artist, youtube_url)
+        await update.message.reply_text(
+            "SEO metadata ready ✅\n\n"
+            f"Title: {metadata['title']}\n\n"
+            f"Tags: {', '.join(metadata['tags'][:8])}..."
+        )
+        await update.message.reply_text(f"YouTube par upload kar raha hoon as {DEFAULT_PRIVACY}...")
+        video_id = await asyncio.to_thread(
+            upload_for_user,
+            user_id,
+            video_path,
+            thumb_path,
+            metadata["title"],
+            metadata["description"],
+            metadata["tags"],
+            DEFAULT_PRIVACY,
+        )
+        await update.message.reply_text(
+            "✅ Done bhai! Video upload ho gaya:\n"
+            f"https://www.youtube.com/watch?v={video_id}"
+        )
+    except Exception as exc:
+        await update.message.reply_text(
+            "❌ Error aa gaya:\n"
+            f"{exc}\n\n"
+            "Agar YouTube download issue hai to yt-dlp update karna padega, ya hosting storage/time limit ho sakti hai."
+        )
+    finally:
+        context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+
+async def audio_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    if not update.effective_user or not update.message:
+        return ConversationHandler.END
+    payload = PENDING_RETRY_JOBS.get(update.effective_user.id)
+    if not payload:
+        await update.message.reply_text("Koi pending failed YouTube-link job nahi mila. /new se start karo.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["retry_payload"] = payload
+    await update.message.reply_text("Same title/thumbnail/outro saved hai ✅ Ab sirf MP3/M4A audio file bhejo.")
+    return WAITING_RETRY_AUDIO
+
+
+async def receive_retry_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await reject_if_unauthorized(update):
+        return ConversationHandler.END
+    payload = context.user_data.get("retry_payload")
+    if not payload:
+        await update.message.reply_text("Retry data missing. /new se start karo.")
+        return ConversationHandler.END
+    msg = update.message
+    file_id = None
+    ext = ".mp3"
+    if msg.audio:
+        file_id = msg.audio.file_id
+        ext = Path(msg.audio.file_name or "song.mp3").suffix or ".mp3"
+    elif msg.document:
+        name = msg.document.file_name or "song.mp3"
+        ext = Path(name).suffix.lower() or ".mp3"
+        if ext not in AUDIO_EXTS:
+            await update.message.reply_text("Please MP3/M4A/AAC/WAV audio file bhejo.")
+            return WAITING_RETRY_AUDIO
+        file_id = msg.document.file_id
+    else:
+        await update.message.reply_text("Please audio file bhejo.")
+        return WAITING_RETRY_AUDIO
+    payload["source_type"] = "telegram_audio"
+    payload["audio_file_id"] = file_id
+    payload["audio_ext"] = ext
+    payload["youtube_url"] = payload.get("youtube_url")
+    payload["job_id"] = f"{update.effective_user.id}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-retry"
+    await asyncio.to_thread(dispatch_github_worker, payload)
+    await update.message.reply_text("🚀 Retry job GitHub worker ko bhej diya. Ab audio file se render/upload hoga.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # /cancel JOB-ID cancels a Facebook job; bare /cancel keeps the original
+    # conversation-cancel behavior (existing functionality unchanged).
+    if context.args and ENABLE_FACEBOOK_SECOND_CHANNEL:
+        await fb_cancel_cmd(update, context)
+        return ConversationHandler.END
+    context.user_data.clear()
+    if update.message:
+        await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+# ==================== DAILY TREND REPORT + APPROVE WORKFLOW ====================
+
+async def trend_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    await update.message.reply_text("🔍 Running trend diagnostics... this may take 30–60s.")
+    try:
+        report = await asyncio.to_thread(trend_debug_info)
+        # Telegram max message length ~4096; split safely
+        for i in range(0, len(report), 3900):
+            chunk = report[i : i + 3900]
+            await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+    except Exception as exc:
+        await update.message.reply_text(f"❌ trend_debug error:\n{exc}")
+
+
+def _build_daily_report_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Render the approve-able daily report from the imported `trends` table.
+
+    Shared by /daily_report and the 🔄 Refresh button so both show the same
+    per-trend Approve buttons (callback_data=approve_trend_<id>).
+    """
+    from agents.db import fetchall
+    trends = fetchall("SELECT * FROM trends ORDER BY opportunity_score DESC LIMIT 5")
+
+    if not trends:
+        report_text = (
+            "📈 No imported trends available.\n\n"
+            "Use /import_trends to add trending songs from Agent Reach.\n"
+            "Or use /bulk_upload to queue songs directly for upload.\n\n"
+            "Example:\n"
+            "/import_trends\n"
+            "Song Name 1 | https://youtube.com/watch?v=abc\n"
+            "Song Name 2 | https://youtube.com/watch?v=def"
+        )
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="refresh_report")]]
+        return report_text, InlineKeyboardMarkup(keyboard)
+
+    report_lines = ["📈 Today's Best Upload Opportunities\n"]
+    keyboard = []
+
+    for i, trend in enumerate(trends, 1):
+        song = trend["song_name"][:50]
+        artist = (trend.get("artist") or "Unknown")[:30]
+        platform = trend.get("source_platform", "Unknown")
+        growth = trend.get("growth_score", 0)
+        opp = trend.get("opportunity_score", 0)
+        trend_id = trend["id"]
+
+        report_lines.append(
+            f"{i}. {song}\n"
+            f"   🎤 {artist} | 📱 {platform}\n"
+            f"   📈 Growth: +{growth}% | 🎯 Opp: {opp}\n"
+        )
+        keyboard.append([InlineKeyboardButton(f"Approve #{i}", callback_data=f"approve_trend_{trend_id}")])
+
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_report")])
+
+    return "\n".join(report_lines), InlineKeyboardMarkup(keyboard)
+
+
+async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await reject_if_unauthorized(update):
+        return
+    if not ENABLE_RECOMMENDATIONS:
+        await update.message.reply_text("Trend recommendations are currently disabled.")
+        return
+
+    await update.message.reply_text("📡 Fetching trends... this may take a moment.")
+
+    report_text, reply_markup = _build_daily_report_view()
+    await update.message.reply_text(report_text, reply_markup=reply_markup)
+
+
+async def approve_song_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if not ENABLE_APPROVE_WORKFLOW:
+        try:
+            await query.edit_message_text("Approve workflow is currently disabled.")
+        except Exception as e:
+            if "Message is not modified" not in str(e):
+                raise
+        return
+
+    # Parse trend_id from callback_data: "approve_trend_123"
+    callback_data = query.data or ""
+    try:
+        trend_id = int(callback_data.split("_")[-1])
+    except (ValueError, IndexError):
+        await query.edit_message_text("❌ Invalid trend selection.")
+        return
+
+    # Load SPECIFIC trend by ID from database
+    from agents.db import fetchone
+    trend = fetchone("SELECT * FROM trends WHERE id = ?", (trend_id,))
+    if not trend:
+        await query.edit_message_text("❌ Trend not found. Run /daily_report to refresh.")
+        return
+
+    song_name = trend["song_name"]
+    artist = trend.get("artist", "")
+    youtube_url = trend["youtube_url"]
+
+    # DUPLICATE PROTECTION: Check uploads table
+    if is_already_uploaded(youtube_url):
+        await query.edit_message_text(f"❌ Already uploaded: {song_name}\n{youtube_url}")
+        return
+
+    metadata = generate_seo_metadata(song_name, artist, youtube_url)
+
+    # Auto-select outro
+    outro = select_outro()
+    if not outro:
+        await query.edit_message_text(
+            "❌ No outro videos available.\n"
+            "Use /outro_add to upload at least one outro video first."
+        )
+        return
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    job_id = f"trend-{stamp}"
+    payload = {
+        "job_id": job_id,
+        "chat_id": update.effective_chat.id,
+        "user_id": update.effective_user.id,
+        "song_name": song_name,
+        "artist": artist,
+        "source_type": "youtube_url",
+        "youtube_url": youtube_url,
+        "privacy": DEFAULT_PRIVACY,
+        "custom_title": metadata["title"],
+        "custom_description": metadata["description"],
+        "custom_tags": metadata["tags"],
+        "outro_file_id": outro["file_id"],
+        "outro_ext": outro["ext"],
+    }
+
+    await asyncio.to_thread(dispatch_github_worker, payload)
+    record_outro_usage(outro["outro_id"], job_id)
+
+    try:
+        await query.edit_message_text(
+            f"✅ Approved #{trend_id}: {song_name}\n\n"
+            f"Title: {metadata['title']}\n"
+            f"Privacy: {DEFAULT_PRIVACY}\n\n"
+            "🚀 Job sent to GitHub Actions."
+        )
+    except Exception as e:
+        if "Message is not modified" not in str(e):
+            raise
+
+
+async def refresh_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if not ENABLE_RECOMMENDATIONS:
+        await query.edit_message_text("Trend recommendations are currently disabled.")
+        return
+
+    # Re-render the same per-trend view as /daily_report (same table, same
+    # approve_trend_<id> buttons). Previously this used a different table and a
+    # dead "approve_song" button, plus an orphaned return block that raised
+    # NameError on every click.
+    report_text, reply_markup = await asyncio.to_thread(_build_daily_report_view)
+
+    try:
+        await query.edit_message_text(report_text, reply_markup=reply_markup)
+    except Exception as e:
+        if "Message is not modified" not in str(e):
+            raise
+
+
+def run_flask() -> None:
+    port = int(os.environ.get("PORT", "8080"))
+    flask_app.run(host="0.0.0.0", port=port)
+
+
+
+async def trend_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Phase 4: Show trend analytics"""
+    if await reject_if_unauthorized(update):
+        return
+    from agents.viral_trend_engine import get_trend_analytics
+    stats = get_trend_analytics()
+    if stats['total_analyzed'] == 0:
+        await update.message.reply_text("📊 No trend data available.")
+        return
+        
+    msg = (
+        "📊 **Trend Analytics (Phase 4)**\n\n"
+        f"• Total Analyzed: {stats['total_analyzed']}\n"
+        f"• Avg Opportunity Score: {stats['avg_opportunity']}/100\n"
+        f"• Top Source: {stats['top_source']}\n\n"
+        "**Source Distribution:**\n"
+    )
+    for src, count in stats.get('source_distribution', {}).items():
+        msg += f"  - {src}: {count}\n"
+        
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+
+async def auto_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Phase 5: Toggle Auto Mode"""
+    if await reject_if_unauthorized(update):
+        return
+        
+    from agents.db import fetchone, execute
+    args = context.args
+    if not args:
+        config = fetchone("SELECT * FROM auto_mode_config WHERE id = 1")
+        if not config:
+            await update.message.reply_text("Auto Mode not configured.")
+            return
+        state = "ON" if config["enabled"] else "OFF"
+        await update.message.reply_text(
+            f"🤖 **Auto Mode Status:** {state}\n"
+            f"• Uploads per day: {config['uploads_per_day']}\n"
+            f"• Start time: {config['start_time']}\n"
+            f"• Last run: {config['last_run']}\n\n"
+            "Use `/auto_mode on` or `/auto_mode off` to toggle.",
+            parse_mode="Markdown"
+        )
+        return
+        
+    action = args[0].lower()
+    if action == "on":
+        execute("UPDATE auto_mode_config SET enabled = 1 WHERE id = 1")
+        await update.message.reply_text("✅ Auto Mode is now ON.")
+    elif action == "off":
+        execute("UPDATE auto_mode_config SET enabled = 0 WHERE id = 1")
+        await update.message.reply_text("⏸️ Auto Mode is now OFF.")
+    else:
+        await update.message.reply_text("Usage: `/auto_mode on|off`")
+
+
+async def run_auto_mode_scheduler(bot) -> None:
+    """Phase 5: Auto Mode Scheduler.
+    Checks config every 10 minutes and dispatches uploads if enabled.
+    """
+    from agents.db import fetchone, execute
+    from agents.viral_trend_engine import generate_daily_report
+    import datetime as dt
+
+    print("[AUTO_MODE] Scheduler loop started", flush=True)
+    while True:
+        try:
+            config = fetchone("SELECT * FROM auto_mode_config WHERE id = 1")
+            if config and config["enabled"]:
+                now = dt.datetime.now()
+                current_time = now.strftime("%H:%M")
+                
+                # Simple logic: run once a day at start_time
+                if current_time == config["start_time"]:
+                    last_run = config.get("last_run")
+                    today = now.strftime("%Y-%m-%d")
+                    
+                    if last_run != today:
+                        print(f"[AUTO_MODE] Triggering daily uploads at {current_time}", flush=True)
+                        # Here you would implement the auto-approve logic
+                        execute("UPDATE auto_mode_config SET last_run = ? WHERE id = 1", (today,))
+            
+        except Exception as e:
+            print(f"[AUTO_MODE] Scheduler error: {e}", flush=True)
+            
+        await asyncio.sleep(600) # Check every 10 mins
+
+
+# ==================== FACEBOOK -> SECOND YOUTUBE CHANNEL ====================
+# Isolated automation: separate OAuth (GitHub secrets), separate job table
+# (fb_jobs), separate worker branch. First-channel /new flow untouched.
+
+FB_UPLOAD_HELP = (
+    "📘 Facebook → Second YouTube Channel\n\n"
+    "Usage:\n"
+    "/upload <FACEBOOK_URL>\n"
+    "/upload <FACEBOOK_URL> trim 02:15-38:42\n\n"
+    "• Only videos accessible WITHOUT login are processed —\n"
+    "  private / login-gated / DRM content is refused, never bypassed.\n"
+    "• Fixed outro assets/outro.mp4 is appended automatically.\n"
+    "• Uploads to the SECOND channel as private.\n"
+    "• Only use videos you own, licensed, or permitted to re-upload.\n\n"
+    "Other commands:\n"
+    "/upload_force <URL or JOB-ID> — retry / bypass duplicate check\n"
+    "/status JOB-ID — job status\n"
+    "/cancel JOB-ID — cancel job\n"
+    "/second_channel_check — verify second-channel setup"
+)
+
+
+async def _fb_requirements_ok(update: Update) -> bool:
+    """Check flag + auth + worker mode. Replies with guidance on failure."""
+    if not ENABLE_FACEBOOK_SECOND_CHANNEL:
+        if update.message:
+            await update.message.reply_text("Facebook upload is currently disabled.")
+        return False
+    if await reject_if_unauthorized(update):
+        return False
+    if not update.message:
+        return False
+    if not USE_GITHUB_WORKER:
+        await update.message.reply_text(
+            "Facebook jobs need the GitHub Actions worker.\n"
+            "Set USE_GITHUB_WORKER=true in Render env and redeploy."
+        )
+        return False
+    return True
+
+
+def _dispatch_fb_job(job: dict) -> None:
+    """Dispatch an fb_jobs row to the GitHub worker (second-channel branch)."""
+    payload = {
+        "job_id": job["job_id"],
+        "song_name": f"FB {job['job_id']}",
+        "chat_id": job["chat_id"],
+        "user_id": job["user_id"],
+        "target_channel": "second",
+        "source_type": "facebook_url",
+        "facebook_url": job["facebook_url"],
+        "trim_start": job["trim_start"],
+        "trim_end": job["trim_end"],
+        "privacy": "private",
+        "status_callback_url": f"{BASE_URL}/fb_job_status" if BASE_URL else "",
+    }
+    dispatch_github_worker(payload)
+    fb_job_manager.set_status(job["job_id"], "dispatched", stage="queued_on_github")
+
+
+async def upload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/upload <FACEBOOK_URL> [trim START-END] — queue a Facebook job."""
+    if not await _fb_requirements_ok(update):
+        return
+    text = update.message.text or ""
+    # Strip the command itself so parsing only sees arguments.
+    arg_text = re.sub(r"^/upload(_force)?(@\w+)?\s*", "", text).strip()
+    if not arg_text:
+        await update.message.reply_text(FB_UPLOAD_HELP)
+        return
+
+    fb_url = fb_job_manager.extract_facebook_url(arg_text)
+    if not fb_url:
+        await update.message.reply_text(
+            "❌ No Facebook URL found.\n\n" + FB_UPLOAD_HELP
+        )
+        return
+    try:
+        trim = fb_job_manager.parse_trim_spec(arg_text)
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    try:
+        result = await asyncio.to_thread(
+            fb_job_manager.create_job, user_id, chat_id, fb_url, trim, False
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Job create failed:\n{exc}")
+        return
+
+    if "duplicate" in result:
+        dup = result["duplicate"]
+        await update.message.reply_text(
+            "🔄 Duplicate — this video already has a job:\n\n"
+            f"{fb_job_manager.format_job_status(dup)}\n\n"
+            "Use /upload_force with the URL to run it again anyway,\n"
+            "or /status JOB-ID to track the existing job."
+        )
+        return
+
+    job = result["job"]
+    trim_note = ""
+    if trim:
+        trim_note = (
+            f"\n✂️ Trim: {fb_job_manager.format_timestamp(trim[0])}-"
+            f"{fb_job_manager.format_timestamp(trim[1])}"
+        )
+    await update.message.reply_text(
+        f"📥 Facebook job queued: {job['job_id']}{trim_note}\n"
+        "🚀 Dispatching to GitHub Actions worker..."
+    )
+    try:
+        await asyncio.to_thread(_dispatch_fb_job, job)
+    except Exception as exc:
+        await asyncio.to_thread(
+            fb_job_manager.set_status, job["job_id"], "failed",
+            "dispatch_error", str(exc)[:300], None,
+        )
+        await update.message.reply_text(
+            f"❌ GitHub dispatch failed:\n{exc}\n\n"
+            f"Retry with: /upload_force {job['job_id']}"
+        )
+        return
+    await update.message.reply_text(
+        f"✅ Job {job['job_id']} dispatched.\n"
+        f"Track it: /status {job['job_id']}"
+    )
+
+
+async def upload_force_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/upload_force <URL [trim ...]> — bypass duplicate check.
+    /upload_force JOB-ID — retry a failed/cancelled job."""
+    if not await _fb_requirements_ok(update):
+        return
+    text = update.message.text or ""
+    arg_text = re.sub(r"^/upload_force(@\w+)?\s*", "", text).strip()
+    if not arg_text:
+        await update.message.reply_text(
+            "Usage:\n/upload_force <FACEBOOK_URL> [trim START-END]\n/upload_force JOB-ID"
+        )
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # JOB-ID retry form (no URL present).
+    if not fb_job_manager.extract_facebook_url(arg_text):
+        job_id = arg_text.split()[0]
+        result = await asyncio.to_thread(fb_job_manager.retry_job, job_id)
+        if "error" in result:
+            await update.message.reply_text(f"❌ {result['error']}")
+            return
+        job = result["job"]
+        await update.message.reply_text(
+            f"🔁 Retrying job {job['job_id']} "
+            f"(attempt {job['attempts']}/{job['max_attempts']})..."
+        )
+        try:
+            await asyncio.to_thread(_dispatch_fb_job, job)
+        except Exception as exc:
+            await asyncio.to_thread(
+                fb_job_manager.set_status, job["job_id"], "failed",
+                "dispatch_error", str(exc)[:300], None,
+            )
+            await update.message.reply_text(f"❌ Dispatch failed:\n{exc}")
+            return
+        await update.message.reply_text(f"✅ Job {job['job_id']} re-dispatched.")
+        return
+
+    # Force-new form (bypasses duplicate protection).
+    fb_url = fb_job_manager.extract_facebook_url(arg_text)
+    try:
+        trim = fb_job_manager.parse_trim_spec(arg_text)
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return
+    try:
+        result = await asyncio.to_thread(
+            fb_job_manager.create_job, user_id, chat_id, fb_url, trim, True
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Job create failed:\n{exc}")
+        return
+    job = result["job"]
+    await update.message.reply_text(
+        f"📥 Force job queued: {job['job_id']}\n🚀 Dispatching..."
+    )
+    try:
+        await asyncio.to_thread(_dispatch_fb_job, job)
+    except Exception as exc:
+        await asyncio.to_thread(
+            fb_job_manager.set_status, job["job_id"], "failed",
+            "dispatch_error", str(exc)[:300], None,
+        )
+        await update.message.reply_text(f"❌ Dispatch failed:\n{exc}")
+        return
+    await update.message.reply_text(f"✅ Job {job['job_id']} dispatched.")
+
+
+async def fb_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status JOB-ID — show a Facebook job's status."""
+    if not await _fb_requirements_ok(update):
+        return
+    if not context.args:
+        recent = await asyncio.to_thread(fb_job_manager.list_recent_jobs, 5)
+        if not recent:
+            await update.message.reply_text("No Facebook jobs yet. Use /upload <URL>.")
+            return
+        lines = ["📘 Recent Facebook jobs:\n"]
+        for j in recent:
+            icon = fb_job_manager.STATUS_ICONS.get(j["status"], "❓")
+            lines.append(f"{icon} {j['job_id']} — {j['status']}")
+        lines.append("\nDetails: /status JOB-ID")
+        await update.message.reply_text("\n".join(lines))
+        return
+    job = await asyncio.to_thread(fb_job_manager.get_job, context.args[0])
+    if not job:
+        await update.message.reply_text(f"❌ Job {context.args[0]} not found.")
+        return
+    await update.message.reply_text(fb_job_manager.format_job_status(job))
+
+
+async def fb_cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel JOB-ID — cancel a Facebook job (queued or dispatched)."""
+    if not await _fb_requirements_ok(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /cancel JOB-ID")
+        return
+    result = await asyncio.to_thread(fb_job_manager.cancel_job, context.args[0])
+    if "error" in result:
+        await update.message.reply_text(f"❌ {result['error']}")
+        return
+    await update.message.reply_text(
+        f"{fb_job_manager.format_job_status(result['job'])}\n\n{result['note']}"
+    )
+
+
+async def second_channel_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/second_channel_check — verify second-channel OAuth + outro asset via worker."""
+    if not await _fb_requirements_ok(update):
+        return
+    if not BASE_URL:
+        await update.message.reply_text("BASE_URL missing — cannot build worker callbacks.")
+        return
+    job_id = f"fb-check-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    payload = {
+        "job_id": job_id,
+        "song_name": "Second channel check",
+        "chat_id": update.effective_chat.id,
+        "user_id": update.effective_user.id,
+        "mode": "second_channel_check",
+        "target_channel": "second",
+    }
+    await update.message.reply_text(
+        "🔍 Dispatching second-channel check to GitHub Actions...\n"
+        f"Job: {job_id}\n\n"
+        "The worker will verify YOUTUBE_SECOND_* secrets, confirm the "
+        "channel identity, and check assets/outro.mp4 — result ayega yahin."
+    )
+    try:
+        await asyncio.to_thread(dispatch_github_worker, payload)
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Dispatch failed:\n{exc}")
+
+
+# Every command with a dedicated handler. Used by the unknown-command
+# catch-all (registered LAST) so genuinely-unknown commands get a helpful
+# reply instead of silence, while known commands never double-reply
+# (same-group handlers all fire, so the catch-all must stay quiet for these).
+KNOWN_COMMANDS = frozenset({
+    "start", "id", "auth", "export_youtube_token", "github_test",
+    "audio_retry", "trend_debug", "outro_list", "outro_remove", "outro_test",
+    "queue_status", "queue_pause", "auto_mode", "queue_resume",
+    "queue_cancel", "worker_status", "bulk_upload", "import_trends",
+    "upload", "upload_force", "status", "second_channel_check",
+    "outro_add", "agentreach", "new", "skip", "cancel", "daily_report",
+})
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all for unknown /commands. Registered LAST in group 0.
+
+    Replies only when the command is NOT in KNOWN_COMMANDS, so existing
+    commands (including conversation fallbacks like /skip and /cancel)
+    never receive a duplicate reply.
+    """
+    if await reject_if_unauthorized(update):
+        return
+    if not update.message or not update.message.text:
+        return
+    first = update.message.text.strip().split()[0]
+    cmd = first.split("@")[0].lstrip("/").strip().lower()
+    if not cmd or cmd in KNOWN_COMMANDS:
+        return
+    await update.message.reply_text(
+        f"❓ Unknown command: /{cmd}\n\n"
+        "Send /start to see all available commands."
+    )
+
 
 def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -597,10 +3028,58 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("export_youtube_token", export_youtube_token))
     app.add_handler(CommandHandler("github_test", github_test))
     app.add_handler(CommandHandler("audio_retry", audio_retry))
+    app.add_handler(CommandHandler("trend_debug", trend_debug))
+    app.add_handler(CommandHandler("outro_list", outro_list))
+    app.add_handler(CommandHandler("outro_remove", outro_remove))
+    app.add_handler(CommandHandler("outro_test", outro_test))
+    app.add_handler(CommandHandler("queue_status", queue_status_cmd))
+    app.add_handler(CommandHandler("queue_pause", queue_pause_cmd))
+    app.add_handler(CommandHandler("auto_mode", auto_mode_cmd))
+    app.add_handler(CommandHandler("queue_resume", queue_resume_cmd))
+    app.add_handler(CommandHandler("queue_cancel", queue_cancel_cmd))
+    app.add_handler(CommandHandler("worker_status", worker_status))
+    app.add_handler(CommandHandler("bulk_upload", bulk_upload))
+    app.add_handler(CommandHandler("import_trends", import_trends))
+
+    # Facebook -> second YouTube channel (isolated feature; /cancel JOB-ID is
+    # handled by the extended cancel handler registered below).
+    if ENABLE_FACEBOOK_SECOND_CHANNEL:
+        app.add_handler(CommandHandler("upload", upload_cmd))
+        app.add_handler(CommandHandler("upload_force", upload_force_cmd))
+        app.add_handler(CommandHandler("status", fb_status_cmd))
+        app.add_handler(CommandHandler("second_channel_check", second_channel_check_cmd))
+
+    # Outro add conversation (polling mode)
+    outro_conv = ConversationHandler(
+        entry_points=[CommandHandler("outro_add", outro_add_start)],
+        states={
+            WAITING_OUTRO_VIDEO: [MessageHandler((filters.VIDEO | filters.Document.VIDEO | filters.Document.ALL) & ~filters.COMMAND, receive_outro_video)],
+            WAITING_OUTRO_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_outro_name)],
+            WAITING_OUTRO_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_outro_weight)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(outro_conv)
+
+    # Webhook-safe single-shot outro handler (higher priority for video+caption)
+    app.add_handler(MessageHandler(
+        (filters.VIDEO | filters.Document.VIDEO | filters.Document.ALL) & filters.CaptionRegex(r"^/outro_add") & ~filters.COMMAND,
+        outro_add_single_shot,
+    ))
+
+    # Agent Reach — webhook-safe single-shot (primary handler)
+    if ENABLE_AGENTREACH_IMPORT:
+        app.add_handler(CommandHandler("agentreach", agentreach_single_shot))
+        # CSV upload handler for Agent Reach
+        app.add_handler(MessageHandler(
+            filters.Document.FileExtension("csv") & ~filters.COMMAND,
+            agentreach_csv_handler,
+        ))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("new", new_video)],
         states={
+            # After /new accept title/details OR files in any order.
             WAITING_TITLE: [MessageHandler((filters.TEXT | filters.PHOTO | filters.AUDIO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, collect_asset_or_text)],
             WAITING_ARTIST: [
                 CommandHandler("skip", skip_artist),
@@ -619,47 +3098,573 @@ def build_telegram_app() -> Application:
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cancel))
 
+    # General text handler (lowest priority, catches remaining text)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bulk_text))
+
+    print(f"ENABLE_RECOMMENDATIONS value: {ENABLE_RECOMMENDATIONS}")
+
     if ENABLE_RECOMMENDATIONS:
+        print("REGISTERING DAILY REPORT HANDLER")
         app.add_handler(CommandHandler("daily_report", daily_report))
+        print("DAILY REPORT HANDLER REGISTERED")
+
+    if ENABLE_BULK_UPLOAD:
+        app.add_handler(CallbackQueryHandler(bulk_confirm_callback, pattern=r"^bulk_confirm_"))
+        app.add_handler(CallbackQueryHandler(bulk_cancel_callback, pattern=r"^bulk_cancel_"))
+
+    # Import trends callbacks (always enabled as primary workflow)
+    app.add_handler(CallbackQueryHandler(import_trends_confirm_callback, pattern=r"^import_confirm_"))
+    app.add_handler(CallbackQueryHandler(import_trends_cancel_callback, pattern=r"^import_cancel_"))
 
     if ENABLE_APPROVE_WORKFLOW:
-        app.add_handler(CallbackQueryHandler(approve_song_callback, pattern="^approve_song$"))
+        app.add_handler(CallbackQueryHandler(approve_song_callback, pattern=r"^approve_trend_\d+$"))
         app.add_handler(CallbackQueryHandler(refresh_report_callback, pattern="^refresh_report$"))
+
+    if ENABLE_AGENTREACH_IMPORT:
+        # Legacy polling-mode callbacks
+        app.add_handler(CallbackQueryHandler(agentreach_confirm_callback, pattern="^agentreach_confirm$"))
+        app.add_handler(CallbackQueryHandler(agentreach_cancel_callback, pattern="^agentreach_cancel$"))
+        # Webhook-safe DB session callbacks
+        app.add_handler(CallbackQueryHandler(agentreach_db_confirm_callback, pattern=r"^ar_confirm_"))
+        app.add_handler(CallbackQueryHandler(agentreach_db_cancel_callback, pattern=r"^ar_cancel_"))
+
+    # Unknown-command catch-all MUST stay last: it only replies for commands
+    # outside KNOWN_COMMANDS, so nothing else can be shadowed or double-reply.
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+
+    # Startup inventory: proves in deploy logs exactly which commands are live.
+    print(f"[STARTUP] Registered commands ({len(KNOWN_COMMANDS)}): {', '.join(sorted(KNOWN_COMMANDS))}", flush=True)
+    print(f"[STARTUP] Handler groups: {sorted(app.handlers.keys())}, group-0 handlers: {len(app.handlers.get(0, []))}", flush=True)
 
     return app
 
 
+@flask_app.route("/verify")
+def verify():
+    """Production verification endpoint. Returns raw DB rows."""
+    from agents.db import fetchall, is_using_postgres
+    
+    result = {"backend": "postgresql" if is_using_postgres() else "sqlite"}
+    
+    # uploads table
+    result["uploads"] = fetchall("SELECT id, song_name, youtube_url, youtube_video_id, source, uploaded_at FROM uploads ORDER BY id DESC LIMIT 10")
+    
+    # upload_queue
+    result["queue"] = fetchall("SELECT id, song_name, youtube_url, status, source, created_at FROM upload_queue ORDER BY id DESC LIMIT 10")
+    
+    # outros
+    result["outros"] = fetchall("SELECT id, name, file_id, file_unique_id, ext, weight, is_active, added_at FROM outros ORDER BY id")
+    
+    # outro_history
+    result["outro_history"] = fetchall("SELECT id, outro_id, upload_id, used_at FROM outro_history ORDER BY used_at DESC LIMIT 10")
+    
+    # trends
+    result["trends"] = fetchall("SELECT id, song_name, artist, youtube_url, source_platform, opportunity_score FROM trends ORDER BY opportunity_score DESC LIMIT 10")
+    
+    # queue_history
+    result["queue_history"] = fetchall("SELECT id, queue_id, action, detail, created_at FROM queue_history ORDER BY id DESC LIMIT 10")
+    
+    # system_state
+    result["system_state"] = fetchall("SELECT key, value FROM system_state")
+    
+    return result
+
+
+@flask_app.route("/debug_agentreach", methods=["POST"])
+def debug_agentreach():
+    """Debug endpoint to test Agent Reach parsing without Telegram."""
+    try:
+        text = request.json.get("text", "") if request.json else ""
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        if text.startswith("/agentreach"):
+            lines = [l.strip() for l in text[len("/agentreach"):].split("\n") if l.strip()]
+        valid, invalid, duplicate = _parse_agentreach_lines(lines)
+        return {
+            "total": len(lines),
+            "valid": valid,
+            "invalid": invalid,
+            "duplicate": duplicate,
+        }
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
+
+@flask_app.route("/create_session", methods=["POST"])
+def create_session():
+    """Create a test session for debug purposes."""
+    try:
+        user_id = request.json.get("user_id", 1768510980)
+        candidates = request.json.get("candidates", [])
+        session_id = _store_agentreach_session(user_id, candidates, [], [], source="api_test")
+        return {"session_id": session_id, "candidates": len(candidates)}
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
+
+@flask_app.route("/debug_callback", methods=["POST"])
+def debug_callback():
+    """Debug endpoint to test Agent Reach confirm callback without Telegram."""
+    try:
+        session_id = request.json.get("session_id", "")
+        user_id = request.json.get("user_id", 1768510980)
+        chat_id = request.json.get("chat_id", 1768510980)
+        
+        session = _load_agentreach_session(user_id, session_id)
+        if not session:
+            return {"error": "Session not found"}, 404
+        
+        candidates = session.get("candidates", [])
+        if not candidates:
+            return {"error": "No candidates"}, 400
+        
+        result = add_multiple_items_transactional(user_id, chat_id, candidates, source="agentreach")
+        return result
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
+
+@flask_app.route("/seed_outro", methods=["POST"])
+def seed_outro():
+    """Seed a test outro for QA verification. Protected by webhook secret."""
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if secret != WEBHOOK_SECRET:
+        return {"error": "Unauthorized"}, 401
+    
+    from agents.db import execute
+    from datetime import datetime
+    
+    execute(
+        """INSERT INTO outros (name, file_id, file_unique_id, ext, weight, is_active, added_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(file_id) DO UPDATE SET
+               name=excluded.name,
+               file_unique_id=excluded.file_unique_id,
+               ext=excluded.ext,
+               weight=excluded.weight,
+               is_active=1""",
+        ("QA Test Outro", "test_file_id_001", "test_unique_id_001", ".mp4", 10, 1, datetime.now().isoformat())
+    )
+    
+    return {"status": "ok", "message": "Test outro seeded"}
+
+
+@flask_app.route("/seed_trends", methods=["POST"])
+def seed_trends():
+    """Seed test trends for Phase 1 verification. Protected by webhook secret."""
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if secret != WEBHOOK_SECRET:
+        return {"error": "Unauthorized"}, 401
+    
+    from agents.db import execute
+    from datetime import datetime
+    
+    test_trends = [
+        ("Test Song Alpha", "Artist A", "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube", 85.5, 120.0, 30.0, 95.0),
+        ("Test Song Beta", "Artist B", "https://www.youtube.com/watch?v=9bZkp7q19f0", "youtube", 72.0, 95.0, 45.0, 80.0),
+        ("Test Song Gamma", "Artist C", "https://www.youtube.com/watch?v=kfVsfOSbJY0", "youtube", 60.0, 80.0, 20.0, 75.0),
+    ]
+    
+    for song, artist, url, platform, viral, growth, competition, opp in test_trends:
+        execute(
+            """INSERT INTO trends (song_name, artist, youtube_url, source_platform, viral_score, growth_score, competition_score, opportunity_score, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (song, artist, url, platform, viral, growth, competition, opp, dt.datetime.now().isoformat())
+        )
+    
+    return {"status": "ok", "seeded": len(test_trends)}
+
+
+@flask_app.route("/test_dispatch", methods=["POST"])
+def test_dispatch():
+    """Trigger a test GitHub Actions dispatch for verification."""
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if secret != WEBHOOK_SECRET:
+        return {"error": "Unauthorized"}, 401
+    
+    from agents.outro_manager import select_outro
+    outro = select_outro()
+    if not outro:
+        return {"error": "No outro available"}, 400
+    
+    payload = {
+        "job_id": "verify-test-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "chat_id": 1768510980,
+        "user_id": 1768510980,
+        "song_name": "Verification Test Song",
+        "artist": "Test Artist",
+        "source_type": "youtube_url",
+        "youtube_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "privacy": "private",
+        "custom_title": "Verification Test Upload",
+        "custom_description": "This is a test dispatch for Phase 1 verification.",
+        "custom_tags": ["test", "verification"],
+        "outro_file_id": outro["file_id"],
+        "outro_ext": outro["ext"],
+    }
+    
+    try:
+        dispatch_github_worker(payload)
+        return {"status": "dispatched", "job_id": payload["job_id"], "outro_file_id": outro["file_id"]}
+    except Exception as exc:
+        return {"error": str(exc)}, 500
+
+
+@flask_app.route("/github_status", methods=["POST"])
+def github_status():
+    """Callback endpoint for GitHub Actions worker to report job status.
+    
+    Expected JSON body:
+    {
+        "job_id": "...",
+        "status": "downloading|rendering|uploading|completed|failed",
+        "stage": "description of current stage",
+        "error_message": "optional error text"
+    }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        job_id = data.get("job_id", "")
+        status = data.get("status", "")
+        stage = data.get("stage", "")
+        error_message = data.get("error_message", "")
+
+        if not job_id or not status:
+            return {"error": "job_id and status required"}, 400
+
+        from agents.db import execute
+        now = dt.datetime.now().isoformat()
+        execute(
+            """UPDATE github_jobs
+               SET status = ?, stage = ?, error_message = ?, updated_at = ?
+               WHERE job_id = ?""",
+            (status, stage, error_message, now, job_id)
+        )
+
+        # Notify user via Telegram if bot is ready
+        if telegram_app and BOT_LOOP:
+            # Find chat_id from job_id pattern: user_id-timestamp
+            try:
+                user_id = int(job_id.split("-")[0])
+                icon = "✅" if status == "completed" else "❌" if status == "failed" else "🔄"
+                msg = f"{icon} GitHub Worker Update\n\nJob: {job_id}\nStatus: {status}\nStage: {stage}"
+                if error_message:
+                    msg += f"\nError: {error_message[:100]}"
+                asyncio.run_coroutine_threadsafe(
+                    telegram_app.bot.send_message(chat_id=user_id, text=msg),
+                    BOT_LOOP,
+                )
+            except Exception as e:
+                print(f"[GITHUB_STATUS] Notify failed: {e}", flush=True)
+
+        return {"status": "ok", "job_id": job_id}
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
+
+@flask_app.route("/fb_job_status", methods=["POST"])
+def fb_job_status():
+    """Callback endpoint for the GitHub worker to report Facebook job progress.
+
+    Expected JSON body:
+    {
+        "job_id": "fb-...",
+        "status": "dispatched|downloading|processing|uploading|completed|failed",
+        "stage": "free-text stage",
+        "error_message": "optional error text",
+        "youtube_video_id": "optional id on completion"
+    }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        job_id = (data.get("job_id") or "").strip()
+        status = (data.get("status") or "").strip()
+        if not job_id or not status:
+            return {"error": "job_id and status required"}, 400
+        if status not in ("queued", "dispatched", "downloading", "processing",
+                          "uploading", "completed", "failed", "cancelled"):
+            return {"error": f"unknown status '{status}'"}, 400
+        fb_job_manager.set_status(
+            job_id, status,
+            stage=(data.get("stage") or "")[:120],
+            error=(data.get("error_message") or "")[:500] or None,
+            youtube_video_id=(data.get("youtube_video_id") or "")[:32] or None,
+        )
+        print(f"[FB_STATUS] {job_id} -> {status} ({data.get('stage', '')})", flush=True)
+        return {"status": "ok", "job_id": job_id}
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "trace": traceback.format_exc()}, 500
+
+
 def main() -> None:
-    global telegram_app
-    if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN env var missing.")
+    import sys, traceback as tb_mod
+    try:
+        print(f"[STARTUP] Python version: {sys.version}", flush=True)
+        print(f"[STARTUP] Current commit: {_get_commit_hash()}", flush=True)
 
-    telegram_app = build_telegram_app()
+        global telegram_app
+        if not TELEGRAM_BOT_TOKEN:
+            print("[STARTUP] TELEGRAM_BOT_TOKEN missing.", flush=True)
+            raise SystemExit("TELEGRAM_BOT_TOKEN env var missing.")
 
-    if USE_WEBHOOK:
-        if not BASE_URL:
-            raise SystemExit("BASE_URL env var missing. Required for webhook mode.")
-        webhook_url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
+        print(f"[STARTUP] DATABASE_URL present? {'Yes' if os.environ.get('DATABASE_URL') else 'No'}", flush=True)
 
-        def bot_loop_thread() -> None:
-            global BOT_LOOP
-            loop = asyncio.new_event_loop()
-            BOT_LOOP = loop
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(telegram_app.initialize())
-            loop.run_until_complete(telegram_app.bot.delete_webhook(drop_pending_updates=True))
-            loop.run_until_complete(telegram_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES))
-            loop.run_until_complete(telegram_app.start())
-            print(f"Telegram webhook set: {webhook_url}", flush=True)
-            loop.run_forever()
+        from agents.db import is_using_postgres
+        backend = "PostgreSQL" if is_using_postgres() else "SQLite"
+        print(f"[STARTUP] Selected backend: {backend}", flush=True)
 
-        thread = threading.Thread(target=bot_loop_thread, daemon=True)
-        thread.start()
-        run_flask()
-    else:
-        thread = threading.Thread(target=run_flask, daemon=True)
-        thread.start()
-        telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+        print("[STARTUP] Connecting to database...", flush=True)
+        from agents.db import get_connection
+        conn = get_connection()
+        conn_type = type(conn).__name__
+        print(f"[STARTUP] Database connected ({conn_type})", flush=True)
+        conn.close()
+
+        print("[STARTUP] Initializing tables...", flush=True)
+        init_all_tables()
+        print("[STARTUP] Tables initialized", flush=True)
+
+        # OAuth config check
+        oauth_env_set = bool(os.environ.get("GOOGLE_CLIENT_SECRETS_JSON", "").strip())
+        oauth_file_exists = GOOGLE_CLIENT_SECRETS_PATH.exists()
+        if oauth_env_set or oauth_file_exists:
+            print(f"[STARTUP] OAuth config OK (env_var={oauth_env_set}, file={oauth_file_exists})", flush=True)
+        else:
+            print("[STARTUP] WARNING: OAuth config missing. /auth and /new will not work.", flush=True)
+            print("[STARTUP] Set GOOGLE_CLIENT_SECRETS_JSON env var or deploy client_secrets.json", flush=True)
+            print("[STARTUP] Expected format: JSON with 'web' key containing client_id, client_secret, auth_uri, token_uri", flush=True)
+
+        # Cobalt connection test
+        print("[STARTUP] Testing Cobalt API connection...", flush=True)
+        from downloaders import test_cobalt_connection, discover_cobalt_url
+        discovered = discover_cobalt_url()
+        if discovered:
+            print(f"[STARTUP] Cobalt auto-configured: {discovered}", flush=True)
+        else:
+            cobalt_ok, cobalt_msg = test_cobalt_connection()
+            print(f"[STARTUP] Cobalt status: {cobalt_msg}", flush=True)
+            if not cobalt_ok:
+                print("[STARTUP] WARNING: Cobalt unavailable. yt-dlp fallback will be used.", flush=True)
+
+        print("[STARTUP] Building Telegram app...", flush=True)
+        telegram_app = build_telegram_app()
+        print("[STARTUP] Telegram app built", flush=True)
+
+        if USE_WEBHOOK:
+            if not BASE_URL:
+                print("[STARTUP] BASE_URL missing.", flush=True)
+                raise SystemExit("BASE_URL env var missing. Required for webhook mode.")
+            webhook_url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
+
+            def bot_loop_thread() -> None:
+                global BOT_LOOP
+                loop = asyncio.new_event_loop()
+                BOT_LOOP = loop
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(telegram_app.initialize())
+                loop.run_until_complete(telegram_app.bot.delete_webhook(drop_pending_updates=True))
+                loop.run_until_complete(telegram_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES))
+                loop.run_until_complete(telegram_app.start())
+                print(f"[STARTUP] Telegram webhook set: {webhook_url}", flush=True)
+                
+                print("[STARTUP] Starting queue processor...", flush=True)
+                asyncio.run_coroutine_threadsafe(
+                    run_queue_processor(telegram_app.bot, DEFAULT_PRIVACY, dispatch_github_worker),
+                    loop,
+                )
+                print("[STARTUP] Queue processor scheduled", flush=True)
+
+                print("[STARTUP] Starting scheduler...", flush=True)
+                asyncio.run_coroutine_threadsafe(
+                    run_auto_mode_scheduler(telegram_app.bot),
+                    loop,
+                )
+                print("[STARTUP] Scheduler started", flush=True)
+        
+                loop.run_forever()
+
+            print("[STARTUP] Starting bot thread...", flush=True)
+            thread = threading.Thread(target=bot_loop_thread, daemon=True)
+            thread.start()
+
+            port = int(os.environ.get("PORT", "8080"))
+            print(f"[STARTUP] Binding to PORT {port}...", flush=True)
+            print("[STARTUP] Application started successfully", flush=True)
+            flask_app.run(host="0.0.0.0", port=port)
+        else:
+            print("[STARTUP] Starting Flask thread...", flush=True)
+            thread = threading.Thread(target=run_flask, daemon=True)
+            thread.start()
+            print("[STARTUP] Application started successfully", flush=True)
+            telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception:
+        print("\n===== STARTUP ERROR =====", flush=True)
+        print(f"Exception type: {type(sys.exc_info()[1]).__name__}", flush=True)
+        print(f"Exception: {sys.exc_info()[1]}", flush=True)
+        print("Full traceback:", flush=True)
+        print(tb_mod.format_exc(), flush=True)
+        print("=========================\n", flush=True)
+        raise
+
+
+
+@flask_app.route("/toggle_queue", methods=["POST"])
+def toggle_queue():
+    from agents.queue_engine import is_paused, set_paused
+    current = is_paused()
+    set_paused(not current)
+    return "OK", 200
+
+
+@flask_app.route("/db_status")
+def db_status():
+    """Show current database backend and persistence status. Restored from 0c45a39."""
+    from agents.db import is_using_postgres, DATABASE_URL, DB_PATH, _FORCE_SQLITE
+    from pathlib import Path
+    return {
+        "backend": "postgresql" if is_using_postgres() else "sqlite",
+        "database_url_set": bool(DATABASE_URL),
+        "sqlite_path": DB_PATH,
+        "sqlite_exists": Path(DB_PATH).exists(),
+        "fallback_active": _FORCE_SQLITE,
+        "persistence_warning": "SQLite is ephemeral on Render. Set DATABASE_URL env var to use PostgreSQL (Supabase/etc) for persistent storage.",
+    }
+
+@flask_app.route("/system_health")
+def system_health():
+    if not ENABLE_SYSTEM_HEALTH:
+        return {"error": "System health disabled"}, 403
+    from agents.db import is_using_postgres, _FORCE_SQLITE, fetchall, get_connection
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT 1")
+        c.fetchone()
+        conn.close()
+        db_ok = True
+    except Exception as e:
+        db_ok = False
+        
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "backend": "postgresql" if is_using_postgres() else "sqlite",
+        "fallback_active": _FORCE_SQLITE,
+        "database_connected": db_ok
+    }
+
+@flask_app.route("/health")
+def health():
+    """Health check endpoint. Tests Cobalt API connectivity and database."""
+    from agents.db import is_using_postgres, _FORCE_SQLITE, get_connection
+    from downloaders import test_cobalt_connection
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT 1")
+        c.fetchone()
+        conn.close()
+        db_ok = True
+    except Exception:
+        db_ok = False
+
+    cobalt_ok, cobalt_msg = test_cobalt_connection()
+    status = "ok" if (db_ok and cobalt_ok) else "degraded" if db_ok else "error"
+    return {
+        "status": status,
+        "database": {
+            "connected": db_ok,
+            "backend": "postgresql" if is_using_postgres() else "sqlite",
+            "fallback_active": _FORCE_SQLITE,
+        },
+        "cobalt": {
+            "connected": cobalt_ok,
+            "message": cobalt_msg,
+        },
+    }
+
+@flask_app.route("/dashboard")
+def dashboard():
+    """HTML Dashboard for bot monitoring."""
+    if not ENABLE_DASHBOARD:
+        return "Dashboard is disabled via feature flags.", 403
+        
+    from agents.db import is_using_postgres, _FORCE_SQLITE
+    from agents.queue_engine import get_summary, get_queue, is_paused
+    
+    summary = get_summary()
+    queue = get_queue(limit=10)
+    
+    # Simple HTML template
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>YouTube Song Bot Dashboard</title>
+        <style>
+            body {{ font-family: sans-serif; margin: 20px; background: #f4f4f9; }}
+            .card {{ background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+            h2 {{ color: #333; margin-top: 0; }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }}
+            .status-pending {{ color: orange; }}
+            .status-processing {{ color: blue; }}
+            .status-completed {{ color: green; }}
+            .status-failed {{ color: red; }}
+            .badge {{ padding: 4px 8px; border-radius: 4px; font-size: 0.8em; font-weight: bold; }}
+            .badge-pg {{ background: #336791; color: white; }}
+            .badge-sqlite {{ background: #003b57; color: white; }}
+            .badge-error {{ background: #dc3545; color: white; }}
+        </style>
+    
+    <script>
+    function toggleQueue() {{
+        fetch('/toggle_queue', {{method: 'POST'}})
+        .then(() => window.location.reload());
+    }}
+    </script>
+</head>
+    <body>
+        <h1>YouTube Song Bot Dashboard</h1>
+        
+        <div class="card">
+            <h2>Database Status</h2>
+            <p>Backend: 
+                <span class="badge {'badge-pg' if is_using_postgres() else 'badge-sqlite'}">
+                    {'PostgreSQL' if is_using_postgres() else 'SQLite'}
+                </span>
+                {f' <span class="badge badge-error">Fallback Active</span>' if _FORCE_SQLITE else ''}
+            </p>
+        </div>
+        
+        <div class="card">
+            <h2>Queue Summary</h2><p>Status: { 'Paused ⏸️' if is_paused() else 'Active ▶️' } <button onclick="toggleQueue()" style="padding: 5px 10px; cursor: pointer;">Toggle Queue</button></p>
+            <table>
+                <tr><th>Total</th><th>Pending</th><th>Processing</th><th>Completed</th><th>Failed</th></tr>
+                <tr>
+                    <td>{summary['total']}</td>
+                    <td>{summary['pending']}</td>
+                    <td>{summary['processing']}</td>
+                    <td>{summary['completed']}</td>
+                    <td>{summary['failed']}</td>
+                </tr>
+            </table>
+        </div>
+        
+        <div class="card">
+            <h2>Recent Jobs</h2>
+            <table>
+                <tr><th>ID</th><th>Song</th><th>Status</th><th>Created At</th></tr>
+                {"".join([f"<tr><td>{j['id']}</td><td>{j['song_name']}</td><td class='status-{j['status']}'>{j['status']}</td><td>{j['created_at']}</td></tr>" for j in queue])}
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 
 if __name__ == "__main__":
