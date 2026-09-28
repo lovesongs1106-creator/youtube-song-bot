@@ -19,6 +19,9 @@ jobs:
       VIDEO_HEIGHT: ${{ vars.VIDEO_HEIGHT || '1080' }}
       VIDEO_FPS: ${{ vars.VIDEO_FPS || '30' }}
       FFMPEG_PRESET: ${{ vars.FFMPEG_PRESET || 'veryfast' }}
+      YOUTUBE_SECOND_CLIENT_ID: ${{ secrets.YOUTUBE_SECOND_CLIENT_ID }}
+      YOUTUBE_SECOND_CLIENT_SECRET: ${{ secrets.YOUTUBE_SECOND_CLIENT_SECRET }}
+      YOUTUBE_SECOND_REFRESH_TOKEN: ${{ secrets.YOUTUBE_SECOND_REFRESH_TOKEN }}
 
     steps:
       - name: Checkout repository
